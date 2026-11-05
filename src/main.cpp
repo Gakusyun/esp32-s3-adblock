@@ -145,6 +145,16 @@ String      portalOpts;             // <option> list of scanned networks, built 
 bool     blockingOn = true;
 uint32_t resumeAt   = 0;            // millis() to auto-resume; 0 = paused indefinitely / not paused
 
+// On-board RGB status LED (WS2812). Some clones wire it to GPIO38 instead of 48:
+// override with -D LED_PIN=38 (or in secrets.h) if the panel switch does nothing.
+#ifndef LED_PIN
+#define LED_PIN 48
+#endif
+// On/off is a user setting (panel: 系统 → 指示灯), persisted in /led.cfg.
+// When off the LED is driven to black; some boards also have a hardwired power
+// LED that no firmware can switch off.
+bool ledOn = true;
+
 // ---------- hashing / matching ----------
 static uint64_t fnv40(const char* s, size_t n) {
   uint64_t h = 0xcbf29ce484222325ULL;
@@ -278,6 +288,30 @@ static void loadCustom() {
   f.close();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+
+// ---------- on-board RGB LED ----------
+// Status colours: blue = booting / no Wi-Fi, green = blocking, amber = paused.
+// "Off" means the LED is driven dark (an LED has no black — it just goes out).
+// rgbLedWrite() takes care of the pin setup (RMT), so no pinMode() is needed.
+// Only re-drive the LED when the state actually changes: rgbLedWrite() is not free.
+static uint8_t ledState = 255;   // 0 = off, 1 = blue, 2 = green, 3 = amber
+static void applyLed() {
+  uint8_t s = !ledOn ? 0 : (WiFi.status() != WL_CONNECTED ? 1 : (blockingOn ? 2 : 3));
+  if (s == ledState) return;
+  ledState = s;
+  switch (s) {
+    case 0:  rgbLedWrite(LED_PIN, 0, 0, 0); break;                                  // dark
+    case 1:  rgbLedWrite(LED_PIN, 0, 0, RGB_BRIGHTNESS); break;                     // blue
+    case 2:  rgbLedWrite(LED_PIN, 0, RGB_BRIGHTNESS, 0); break;                     // green
+    default: rgbLedWrite(LED_PIN, RGB_BRIGHTNESS, RGB_BRIGHTNESS / 2, 0); break;    // amber
+  }
+}
+static void loadLedCfg() {
+  File f = LittleFS.open("/led.cfg", "r"); if (!f) return;
+  String v = f.readStringUntil('\n'); v.trim(); f.close();
+  if (v.length()) ledOn = v.toInt() != 0;
+}
+static void saveLedCfg() { File f = LittleFS.open("/led.cfg", "w"); if (!f) return; f.println(ledOn ? 1 : 0); f.close(); }
 static bool addCustomDomain(const String& raw) {
   String d; if (!normDomain(raw, d)) return false;
   if (numCustom >= MAX_CUSTOM) return false;
@@ -770,6 +804,8 @@ static void handleStats() {
              ",\"upurl\":\"" + jesc(updateUrl) + "\",\"uphour\":" + updateHour + ",\"uptz\":" + updateTz +
              ",\"upday\":" + lastUpdateDay + ",\"upstat\":\"" + jesc(updateStatus) + "\"" +
              ",\"blocking\":" + (blockingOn ? "true" : "false") +
+             ",\"led\":" + (ledOn ? "true" : "false") +
+             ",\"ledPin\":" + LED_PIN +
              ",\"resumeIn\":" + (uint32_t)(!blockingOn && resumeAt ? (resumeAt - millis()) / 1000 : 0) +
              ",\"dnsHit\":" + dnsCacheHits + ",\"dnsMiss\":" + dnsCacheMiss +
              ",\"dnsCacheN\":" + dnsCacheUsed() + ",\"dnsCacheCap\":" + DNS_CACHE_SLOTS +
@@ -1287,8 +1323,9 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadHosts(); loadUpdateCfg();
+  loadCustom(); loadBanned(); loadHosts(); loadUpdateCfg(); loadLedCfg();
   Serial.printf("custom: %d, hosts: %d, banned: %d\n", numCustom, numHosts, numBanned);
+  applyLed();   // LED off setting survives reboots (default: green status light)
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -1338,9 +1375,17 @@ void setup() {
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
     blockingOn = false; resumeAt = (s > 0) ? millis() + (uint32_t)s * 1000UL : 0;
+    applyLed();
     web.send(200, "text/plain", "paused");
   });
-  web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
+  web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; applyLed();
+    web.send(200, "text/plain", "resumed"); });
+  web.on("/setled", []() {                  // /setled?s=0|1  (absent = toggle)
+    if (!requireAuth()) return;
+    ledOn = web.hasArg("s") ? web.arg("s").toInt() != 0 : !ledOn;
+    saveLedCfg(); applyLed();
+    web.send(200, "text/plain", ledOn ? "on" : "off");
+  });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
   web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
@@ -1367,7 +1412,11 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
   bool busy = handleDns();
-  if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
+  if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) {
+    blockingOn = true; resumeAt = 0; applyLed();   // paused timer expired -> back to green
+  }
   if (updateUrl.length()) autoUpdateTick();   // nightly at updateHour local time
+  { static uint32_t ledNext = 0;              // keep the status colour in sync (Wi-Fi drop, pause expiry)
+    if ((int32_t)(millis() - ledNext) >= 0) { ledNext = millis() + 1000; applyLed(); } }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet
 }

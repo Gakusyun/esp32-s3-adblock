@@ -75,6 +75,9 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
 
 - ESP32-S3，**16MB Flash + 8MB PSRAM**（开发板丝印常见 N16R8），本仓库分区表按 16MB 写死
 - USB 供电要稳（手机充电器 / 路由器 USB 口都行）；USB-UART 桥接芯片为 CH343
+- 板载 **WS2812 RGB 灯**默认接 **GPIO48**（绿色=拦截中、琥珀色=已暂停、蓝色=启动中/未联网），可在面板「系统」页关掉；
+  若你的板子是 GPIO38 的克隆板，用 `-D LED_PIN=38` 或写在 `secrets.h` 里重编译。
+  另有一颗直接接电源的电源指示灯，固件无法控制。
 - 串口参数 **115200 8N1**，设备节点 `/dev/ttyACM0`
 
 ## 编译与烧录
@@ -132,7 +135,7 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 | 规则 | 改规则 URL 与更新间隔、立即拉取、上传 `blocklist.bin` |
 | 屏蔽 | 自定义屏蔽：一个文本框，一行一个域名（也接受 hosts 格式），整表保存 |
 | Hosts | 自定义 hosts 映射：`域名 IP`，设备直接应答该 IP |
-| 系统 | 固件 OTA 上传、设备信息 |
+| 系统 | 指示灯开关（关掉 WS2812）、固件 OTA 上传、设备信息 |
 
 ### 自定义屏蔽 vs Hosts 映射
 
@@ -147,7 +150,7 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 两边都是"整表覆盖"语义：文本框里是什么就存什么，删掉一行再保存即取消。
 
 **认证**：`/`、`/stats.json` 只读开放；改状态的接口（`/auth`、`/ban`、`/setblock`、`/sethosts`、
-`/pause`、`/resume`、`/upload`、`/update`、`/setupdate`、`/fetchnow`）需要
+`/pause`、`/resume`、`/setled`、`/upload`、`/update`、`/setupdate`、`/fetchnow`）需要
 HTTP Basic Auth（`WEB_USER`/`WEB_PASS`）+ 自定义请求头 `X-Requested-With: s3-adblock`（防 CSRF）。
 面板顶部「登录」把凭据存进 `sessionStorage`，之后的请求自动带 `Authorization`。
 网络 OTA 用 `OTA_PASS`：
@@ -212,6 +215,9 @@ curl -i http://<设备IP>/        # 面板
   （近距离完全够用）。实测芯片内部温度从 ~43°C 降到 ~39°C，`dig` 拦截查询 8–16ms、转发 40–48ms。
 - Wi-Fi **modem sleep 保持关闭**（`WiFi.setSleep(false)`）：DNS 响应优先，这是有意的取舍。
 - 冷启动后第一次关联偶尔会被路由器以 `reason=202` 拒绝（旧关联未过期），固件会**自动重试 3 次**。
+- 板载 RGB 灯也能关：面板「系统 → 指示灯」切成关闭，固件就不再驱动 WS2812（`/setled?s=0`），
+  设置存 `/led.cfg`，重启仍生效。开着时绿色=拦截中、琥珀色=已暂停、蓝色=启动中/未联网。
+  部分板子另有一颗直接接电源的指示灯，那颗固件关不掉。
 
 ## 已知限制
 

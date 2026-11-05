@@ -289,7 +289,7 @@ function Header({ stats, auth, onLogin, onLogout }) {
   const online = !!stats;
   return (
     <header className="flex items-center gap-3">
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-50 dark:bg-slate-900 text-xl">🛡️</div>
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-50 dark:bg-slate-900 text-sm font-semibold text-sky-600 dark:text-sky-400">S3</div>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <h1 className="truncate text-lg font-semibold text-slate-900 dark:text-slate-100">S3 AdBlock</h1>
@@ -348,7 +348,7 @@ function Overview({ stats, api, run, busy, ratio, total }) {
         action={<SmallBtn onClick={() => run('refresh', async () => {}, '已刷新')}>刷新</SmallBtn>}
       >
         <div className="flex flex-wrap items-center gap-3">
-          <span className="text-xl">{on ? '🛡️' : '⏸️'}</span>
+          <span className={'h-2.5 w-2.5 shrink-0 rounded-full ' + (on ? 'bg-emerald-500' : 'bg-amber-500')} />
           <div className="min-w-0 flex-1">
             <div className={'font-medium ' + (on ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400')}>
               {on ? '拦截已开启' : stats.resumeIn > 0 ? `已暂停 · ${stats.resumeIn} 秒后恢复` : '已暂停'}
@@ -689,11 +689,58 @@ function Hosts({ stats, api, run, busy }) {
   );
 }
 
-function System({ stats, api, say }) {
+function Toggle({ on, onChange, disabled, onLabel = '已开启', offLabel = '已关闭' }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      disabled={disabled}
+      onClick={() => onChange(!on)}
+      className={
+        'inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs transition-colors disabled:opacity-50 disabled:cursor-not-allowed ' +
+        (on
+          ? 'border-emerald-300 dark:border-emerald-800 bg-emerald-50 dark:bg-black text-emerald-700 dark:text-emerald-400'
+          : 'border-slate-300 dark:border-slate-600 text-slate-500 dark:text-slate-400')
+      }
+    >
+      <span className={'h-2 w-2 rounded-full ' + (on ? 'bg-emerald-500' : 'bg-slate-400 dark:bg-slate-600')} />
+      {on ? onLabel : offLabel}
+    </button>
+  );
+}
+
+function System({ stats, api, run, busy }) {
   const [file, setFile] = useState(null);
   const [msg, setMsg] = useState('');
+  const led = stats?.led !== false;   // undefined (旧固件) 当作开着
   return (
     <>
+      <Card
+        title="指示灯"
+        action={
+          <Toggle
+            on={led}
+            disabled={busy === 'led'}
+            onChange={(next) =>
+              run('led', () => api(`/setled?s=${next ? 1 : 0}`, { method: 'POST' }), next ? '指示灯已开启' : '指示灯已关闭')
+            }
+          />
+        }
+      >
+        <div className="space-y-0.5 text-xs text-slate-500 dark:text-slate-400">
+          <div className="flex items-center gap-1.5">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" />绿色：正在拦截
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-amber-500" />琥珀色：已暂停
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-sky-500" />蓝色：启动中 / 未连上 Wi-Fi
+          </div>
+        </div>
+      </Card>
+
       <Card title="固件 OTA">
         <p className="text-xs text-slate-500 dark:text-slate-400">
           上传 <code>.pio/build/s3/firmware.bin</code>，校验后写入备用分区并重启。
