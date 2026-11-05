@@ -47,20 +47,23 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
 cp src/secrets.example.h src/secrets.h
 #    编辑 src/secrets.h：WiFi、WEB_PASS / OTA_PASS、规则 URL
 
-# 2. 预生成一份规则哈希表打进 LittleFS（也可跳过，设备首次联网会自己拉）
+# 2. 构建网页面板（Preact + Tailwind -> data/index.html.gz，产物已入库，改面板才需要跑）
+cd web && npm install && npm run build && cd ..
+
+# 3. 预生成一份规则哈希表打进 LittleFS（也可跳过，设备首次联网会自己拉）
 python3 tools/build_blocklist.py data/blocklist.bin
 
-# 3. 编译 + 烧录固件 + 烧录文件系统
+# 4. 编译 + 烧录固件 + 烧录文件系统（uploadfs 会把 data/ 打包成 LittleFS）
 pio run -t upload
 pio run -t uploadfs
 
-# 4. 看启动日志
+# 5. 看启动日志
 pio device monitor
 ```
 
 烧完设备会自动连 `secrets.h` 里的 WiFi，面板地址 **http://s3adblock.local**。
 WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlock-XXXX`**，
-手机连上去填 SSID/密码即可；想重新配网：面板点「Forget WiFi」，或**按住 BOOT(GPIO0) 再上电**。
+手机连上去填 SSID/密码即可；想重新配网：**按住 BOOT(GPIO0) 再上电**（会清掉保存的 WiFi 并进配网门户）。
 
 ### 分区表（16MB，双 OTA）
 
@@ -76,15 +79,39 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 
 ## 网页面板
 
-- 统计：总拦截 / 总放行、规则条数、每客户端（IP/MAC）拦截计数、WiFi 信号、芯片温度、可用内存、运行时长
-- 操作：封禁/解封某个客户端、添加/删除自定义屏蔽域名、暂停拦截（30 秒 / 5 分钟 / 30 分钟 / 手动恢复）
-- 规则：网页上传 `blocklist.bin`，或填文本规则 URL 定时自动拉取
-- 固件：网页上传 `.pio/build/s3/firmware.bin` 直接 OTA 重启
+面板是独立的 **Preact + Tailwind CSS** 前端（`web/`），构建后是**一个 18KB 的 gzip HTML**，
+存在 LittleFS 的 `/index.html.gz`，由固件直接吐给浏览器 —— 不依赖 CDN，设备没外网也能打开。
+样式遵循 [Kailoinf/salary-calc](https://github.com/Kailoinf/salary-calc) 的 STYLE.md：
+浅色为主 + `dark:` 跟随系统、白卡片 `rounded-xl`、sky 作强调色、不用自定义 CSS。
 
-**认证**：`/`, `/stats.json` 只读开放；所有会改状态的接口（`/ban`、`/addblock`、`/unblock`、
-`/pause`、`/resume`、`/forgetwifi`、`/upload`、`/update`、`/setupdate`、`/fetchnow`）
-需要 HTTP Basic Auth（`WEB_USER`/`WEB_PASS`）+ 自定义请求头 `X-Requested-With: s3-adblock`
-（防 CSRF）。网络 OTA 用 `OTA_PASS`：
+标签页：
+
+| 标签 | 内容 |
+|---|---|
+| 概览 | 拦截状态（暂停 30s/5min/30min/手动恢复）、拦截/放行/规则数/客户端、温度·内存·信号·时长、规则源 |
+| 客户端 | 每个 IP/MAC 的拦截/放行计数，搜索、封禁/解封 |
+| 规则 | 改规则 URL 与更新间隔、立即拉取、上传 `blocklist.bin` |
+| 屏蔽 | 自定义屏蔽：一个文本框，一行一个域名（也接受 hosts 格式），整表保存 |
+| Hosts | 自定义 hosts 映射：`域名 IP`，设备直接应答该 IP |
+| 系统 | 固件 OTA 上传、设备信息 |
+
+### 自定义屏蔽 vs Hosts 映射
+
+两个功能分开做，各占一个标签页，互不影响：
+
+- **屏蔽**：只写域名，命中就答 `0.0.0.0`（子域名一并拦截）。粘贴一整份 hosts 文件也行，
+  只要域名，前面的 `0.0.0.0` / `127.0.0.1` 会被忽略。最多 512 条。
+- **Hosts 映射**：写 `域名 目标IP`，设备按你给的 IPv4 应答，典型用法 `nas.home 192.168.4.100`。
+  支持父域继承（`nas.home` 也覆盖 `foo.nas.home`）；AAAA 查询返回空应答，客户端自动走 IPv4。
+  最多 128 条。映射优先级高于屏蔽表（显式映射就是显式意图）。
+
+两边都是"整表覆盖"语义：文本框里是什么就存什么，删掉一行再保存即取消。
+
+**认证**：`/`、`/stats.json` 只读开放；改状态的接口（`/auth`、`/ban`、`/setblock`、`/sethosts`、
+`/pause`、`/resume`、`/upload`、`/update`、`/setupdate`、`/fetchnow`）需要
+HTTP Basic Auth（`WEB_USER`/`WEB_PASS`）+ 自定义请求头 `X-Requested-With: s3-adblock`（防 CSRF）。
+面板顶部「登录」把凭据存进 `sessionStorage`，之后的请求自动带 `Authorization`。
+网络 OTA 用 `OTA_PASS`：
 
 ```bash
 pio run -t upload --upload-port s3adblock.local --upload-protocol espota
@@ -132,7 +159,7 @@ curl -i http://<设备IP>/        # 面板
 
 ## 功耗与温度
 
-- CPU 降到 **80MHz**（Wi-Fi 仍正常），网页面板轮询 3s → **10s**，Wi-Fi 发射功率降到 **11dBm**
+- CPU 降到 **80MHz**（Wi-Fi 仍正常），网页面板轮询 5s，Wi-Fi 发射功率降到 **11dBm**
   （近距离完全够用）。实测芯片内部温度从 ~43°C 降到 ~39°C，`dig` 拦截查询 8–16ms、转发 40–48ms。
 - Wi-Fi **modem sleep 保持关闭**（`WiFi.setSleep(false)`）：DNS 响应优先，这是有意的取舍。
 - 冷启动后第一次关联偶尔会被路由器以 `reason=202` 拒绝（旧关联未过期），固件会**自动重试 3 次**。
@@ -157,7 +184,9 @@ curl -i http://<设备IP>/        # 面板
 platformio.ini        目标板 / 烧录参数（唯一 env: s3）
 partitions.csv        16MB 双 OTA 分区表
 src/main.cpp          固件：DNS、面板、OTA、规则解析
-src/page.h            面板 HTML
+src/page.h            文件系统缺面板时的兜底提示页
+web/                  面板前端源码（Preact + Tailwind，npm run build）
+data/index.html.gz    面板构建产物（已入库，随 uploadfs 烧进 LittleFS）
 src/secrets.example.h 配置模板（WiFi / 面板密码 / 规则 URL）
 tools/build_blocklist.py  文本规则 -> 5 字节哈希表
 data/blocklist.bin    预置规则表（本地生成，未入库；烧进 LittleFS 当兜底）

@@ -67,8 +67,15 @@ struct Dev { uint32_t ip; uint8_t mac[6]; uint32_t blocked, allowed, lastSeen; b
 static const int MAX_CLIENTS = 96;
 Dev clients[MAX_CLIENTS]; int numClients = 0;
 
-static const int MAX_CUSTOM = 200;
+static const int MAX_CUSTOM = 512;
 String customDom[MAX_CUSTOM]; uint64_t customHash[MAX_CUSTOM]; int numCustom = 0;
+
+// Hosts-style overrides: answer these names with a fixed IPv4 instead of forwarding.
+// Exact match only (with the same "www." stripping the DNS parser applies, plus
+// parent-domain matching, so `nas.home` also answers `foo.nas.home`).
+struct HostEnt { String dom; uint64_t hash; uint32_t ip; };
+static const int MAX_HOSTS = 128;
+HostEnt hostEnt[MAX_HOSTS]; int numHosts = 0;
 
 static const int MAX_BAN = 32;
 uint32_t bannedIP[MAX_BAN]; int numBanned = 0;
@@ -183,27 +190,133 @@ static bool isBlocked(const char* domain) {
 }
 
 // ---------- persistence ----------
+// Lowercase + strip a leading "www.", the same normalisation the DNS query parser
+// and the rule parser apply, so a user can paste any of those forms.
+static bool normDomain(const String& in, String& out) {
+  String s = in; s.trim(); s.toLowerCase();
+  if (s.startsWith("http://")) s = s.substring(7);
+  if (s.startsWith("https://")) s = s.substring(8);
+  int slash = s.indexOf('/'); if (slash >= 0) s = s.substring(0, slash);
+  while (s.length() && (s[0] == '*' || s[0] == '.')) s = s.substring(1);
+  while (s.length() && s[s.length() - 1] == '.') s = s.substring(0, s.length() - 1);
+  if (s.startsWith("www.") && s.length() > 8) s = s.substring(4);
+  if (s.length() < 3 || s.length() > 253 || s.indexOf('.') < 0) return false;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return false;
+  }
+  out = s; return true;
+}
+static bool isIPv4Token(const String& t) {
+  int dots = 0; if (!t.length()) return false;
+  for (size_t i = 0; i < t.length(); i++) {
+    char c = t[i];
+    if (c == '.') { dots++; continue; }
+    if (c < '0' || c > '9') return false;
+  }
+  return dots == 3;
+}
 static void loadCustom() {
   numCustom = 0; File f = LittleFS.open("/custom.txt", "r"); if (!f) return;
   while (f.available() && numCustom < MAX_CUSTOM) {
-    String l = f.readStringUntil('\n'); l.trim(); l.toLowerCase();
-    if (l.length() && l.indexOf('.') > 0) { customDom[numCustom] = l; customHash[numCustom] = fnv40(l.c_str(), l.length()); numCustom++; }
+    String l = f.readStringUntil('\n'); String d;
+    if (!normDomain(l, d)) continue;
+    bool dup = false; for (int i = 0; i < numCustom; i++) if (customDom[i] == d) { dup = true; break; }
+    if (dup) continue;
+    customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++;
   }
   f.close();
 }
 static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
-static bool addCustom(String d) {
-  d.trim(); d.toLowerCase(); if (d.startsWith("www.")) d = d.substring(4);
-  if (!d.length() || d.indexOf('.') < 0 || numCustom >= MAX_CUSTOM) return false;
+static bool addCustomDomain(const String& raw) {
+  String d; if (!normDomain(raw, d)) return false;
+  if (numCustom >= MAX_CUSTOM) return false;
   for (int i = 0; i < numCustom; i++) if (customDom[i] == d) return false;
-  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; saveCustom(); return true;
+  customDom[numCustom] = d; customHash[numCustom] = fnv40(d.c_str(), d.length()); numCustom++; return true;
 }
-static void removeCustom(String d) {
-  d.toLowerCase();
-  for (int i = 0; i < numCustom; i++) if (customDom[i] == d) {
-    for (int j = i; j < numCustom - 1; j++) { customDom[j] = customDom[j+1]; customHash[j] = customHash[j+1]; }
-    numCustom--; saveCustom(); return;
+// Replace the whole list from the textarea contents. Accepts one domain per line,
+// hosts-file lines ("0.0.0.0 a b c"), and # comments — anything that is not a
+// domain token is ignored, so pasting a full hosts file just works.
+static void setCustomFromText(const String& text) {
+  numCustom = 0;
+  int i = 0; const int n = text.length();
+  while (i <= n && numCustom < MAX_CUSTOM) {
+    int e = text.indexOf('\n', i); if (e < 0) e = n;
+    String line = text.substring(i, e); i = e + 1;
+    int hash = line.indexOf('#'); if (hash >= 0) line = line.substring(0, hash);
+    line.replace('\t', ' ');
+    int p = 0;
+    while (p < (int)line.length()) {
+      while (p < (int)line.length() && line[p] == ' ') p++;
+      int q = line.indexOf(' ', p); if (q < 0) q = line.length();
+      String tok = line.substring(p, q); p = q;
+      if (!tok.length() || isIPv4Token(tok) || tok == "::" || tok == "::1") continue;
+      addCustomDomain(tok);
+    }
+    if (e >= n) break;
   }
+  saveCustom();
+}
+
+// ---------- hosts overrides ----------
+static uint32_t parseIPv4(const String& s) {
+  IPAddress ip; if (!ip.fromString(s)) return 0;
+  uint32_t v = (uint32_t)ip; return v ? v : 0;   // 0.0.0.0 is not a useful target
+}
+static void loadHosts() {
+  numHosts = 0; File f = LittleFS.open("/hosts.txt", "r"); if (!f) return;
+  while (f.available() && numHosts < MAX_HOSTS) {
+    String l = f.readStringUntil('\n');
+    int hash = l.indexOf('#'); if (hash >= 0) l = l.substring(0, hash);
+    l.replace('\t', ' '); l.trim();
+    int sp = l.indexOf(' '); if (sp < 0) continue;
+    String dom = l.substring(0, sp); String ip = l.substring(sp + 1); ip.trim();
+    String d; uint32_t v = parseIPv4(ip);
+    if (!v || !normDomain(dom, d)) continue;
+    hostEnt[numHosts].dom = d; hostEnt[numHosts].hash = fnv40(d.c_str(), d.length());
+    hostEnt[numHosts].ip = v; numHosts++;
+  }
+  f.close();
+}
+static void saveHosts() {
+  File f = LittleFS.open("/hosts.txt", "w"); if (!f) return;
+  for (int i = 0; i < numHosts; i++) { IPAddress ip(hostEnt[i].ip); f.println(hostEnt[i].dom + " " + ip.toString()); }
+  f.close();
+}
+static void setHostsFromText(const String& text) {
+  numHosts = 0;
+  int i = 0; const int n = text.length();
+  while (i <= n && numHosts < MAX_HOSTS) {
+    int e = text.indexOf('\n', i); if (e < 0) e = n;
+    String line = text.substring(i, e); i = e + 1;
+    int hash = line.indexOf('#'); if (hash >= 0) line = line.substring(0, hash);
+    line.replace('\t', ' '); line.trim();
+    int sp = line.indexOf(' '); if (sp < 0) continue;
+    String dom = line.substring(0, sp); String ip = line.substring(sp + 1); ip.trim();
+    if (isIPv4Token(dom)) { String t = dom; dom = ip; ip = t; }   // tolerate "IP domain"
+    int cut = ip.indexOf(' '); if (cut >= 0) ip = ip.substring(0, cut);
+    String d; uint32_t v = parseIPv4(ip);
+    if (!v || !normDomain(dom, d)) continue;
+    bool dup = false; for (int k = 0; k < numHosts; k++) if (hostEnt[k].dom == d) { dup = true; break; }
+    if (dup) continue;
+    hostEnt[numHosts].dom = d; hostEnt[numHosts].hash = fnv40(d.c_str(), d.length());
+    hostEnt[numHosts].ip = v; numHosts++;
+    if (e >= n) break;
+  }
+  saveHosts();
+}
+// Walk the label suffixes (foo.nas.home -> nas.home -> home) so a hosts entry for a
+// parent name also covers its subdomains, mirroring how the blocklist matches.
+static uint32_t hostsLookup(const char* domain) {
+  if (numHosts == 0) return 0;
+  const char* p = domain;
+  while (p && *p) {
+    uint64_t h = fnv40(p, strlen(p));
+    for (int i = 0; i < numHosts; i++) if (hostEnt[i].hash == h) return hostEnt[i].ip;
+    const char* dot = strchr(p, '.'); if (!dot) break;
+    const char* next = dot + 1; if (!strchr(next, '.')) break; p = next;
+  }
+  return 0;
 }
 static bool isBannedIP(uint32_t ip) { for (int i = 0; i < numBanned; i++) if (bannedIP[i] == ip) return true; return false; }
 static void loadBanned() {
@@ -246,12 +359,18 @@ static size_t parseQuery(const uint8_t* pkt, int len, char* out, uint16_t* qtype
   if (o > 4 && strncmp(out, "www.", 4) == 0) { memmove(out, out + 4, o - 3); o -= 4; }
   return o;
 }
-static int buildBlocked(int qend, uint16_t qtype) {
+// Build the reply for a locally-answered name. ip==0 -> blocked (0.0.0.0); a hosts
+// override passes the mapped address. Only A records get an answer; anything else
+// (AAAA, MX, ...) becomes a NOERROR/NODATA reply so clients fall back to IPv4.
+static int buildAnswer(int qend, uint16_t qtype, uint32_t ip) {
   buf[2] = 0x81; buf[3] = 0x80; buf[6] = 0; buf[7] = (qtype == 1) ? 1 : 0; buf[8] = 0; buf[9] = 0; buf[10] = 0; buf[11] = 0;
   if (qtype != 1) return qend;
-  const uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+  uint8_t ans[] = {0xC0,0x0C, 0,1, 0,1, 0,0,1,0x2C, 0,4, 0,0,0,0};
+  IPAddress addr(ip);                                   // round-trip keeps the octet order right
+  for (int k = 0; k < 4; k++) ans[12 + k] = addr[k];
   memcpy(buf + qend, ans, sizeof(ans)); return qend + sizeof(ans);
 }
+static int buildBlocked(int qend, uint16_t qtype) { return buildAnswer(qend, qtype, 0); }
 // Forward to upstream and wait for the reply that actually belongs to THIS query.
 // Issue #10: after one timeout the late reply used to sit in the socket and get relayed
 // to the next client (every answer shifted by one). Now: drain stale datagrams first,
@@ -295,9 +414,12 @@ static bool handleDns() {
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient((uint32_t)cip);
     bool ban = c && c->banned;
-    bool blocked = ban || (blockingOn && dl && numHashes && isBlocked(domain));
+    // hosts overrides win over the blocklist: an explicit mapping is an explicit intent.
+    uint32_t mapped = dl ? hostsLookup(domain) : 0;
+    bool blocked = !mapped && (ban || (blockingOn && dl && numHashes && isBlocked(domain)));
     int rlen;
-    if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
+    if (mapped)  { rlen = buildAnswer(qend, qtype, mapped);       totalAllowed++; if (c) c->allowed++; }
+    else if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else         { rlen = forwardUpstream(qlen, qend);     totalAllowed++; if (c) c->allowed++; }
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
   }
@@ -345,9 +467,26 @@ static void handleStats() {
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + "}"; }
   j += "],\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
+  j += "],\"hosts\":[";
+  for (int i = 0; i < numHosts; i++) { IPAddress ip(hostEnt[i].ip); j += (i ? "," : "");
+    j += "{\"h\":\"" + jesc(hostEnt[i].dom) + "\",\"ip\":\"" + ip.toString() + "\"}"; }
   j += "]}";
   web.send(200, "application/json", j);
 }
+// ---------- dashboard (built by web/build.mjs into data/index.html.gz) ----------
+// The page is one self-contained gzipped HTML (~18KB) stored in LittleFS: no CDN fetch,
+// so the dashboard works even when the device itself has no internet access.
+static void handleRoot() {
+  File f = LittleFS.open("/index.html.gz", "r");
+  if (!f) { web.send_P(200, "text/html", PAGE); return; }   // flash FS not written yet
+  // WebServer adds "Content-Encoding: gzip" itself for a .gz file whose content type
+  // is text/html — sending it manually would duplicate the header and break clients.
+  web.sendHeader("Vary", "Accept-Encoding");
+  web.sendHeader("Cache-Control", "no-cache");
+  web.streamFile(f, "text/html");
+  f.close();
+}
+
 // Upstream shipped every state-changing/OTA endpoint with zero authentication —
 // anyone on the LAN could reflash firmware or rewrite the blocklist. Gate them.
 //
@@ -773,8 +912,8 @@ void setup() {
     Serial.printf("blocklist: %u domains\n", numHashes);
     buildFlashIndex();
   }
-  loadCustom(); loadBanned(); loadUpdateCfg();
-  Serial.printf("custom: %d, banned: %d\n", numCustom, numBanned);
+  loadCustom(); loadBanned(); loadHosts(); loadUpdateCfg();
+  Serial.printf("custom: %d, hosts: %d, banned: %d\n", numCustom, numHosts, numBanned);
 
   // Hold BOOT at power-on to wipe saved WiFi and force the setup portal.
 #if CONFIG_IDF_TARGET_ESP32C3
@@ -798,11 +937,22 @@ void setup() {
 
   dnsServer.begin(DNS_PORT); upstreamCli.begin(0);
   { const char* hdrs[] = { CSRF_HEADER }; web.collectHeaders(hdrs, 1); }  // needed for requireAuth()'s CSRF check
-  web.on("/", []() { web.send_P(200, "text/html", PAGE); });
+  web.on("/", handleRoot);
+  web.on("/auth", []() { if (!requireAuth()) return; web.send(200, "text/plain", "ok"); });
   web.on("/stats.json", handleStats);
   web.on("/ban", handleBan);
-  web.on("/addblock", []() { if (!requireAuth()) return; addCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
-  web.on("/unblock", []() { if (!requireAuth()) return; removeCustom(web.arg("d")); web.send(200, "text/plain", "ok"); });
+  // Custom block list / hosts overrides are edited as a whole (textarea in the UI):
+  // POST the full text, the device re-parses and rewrites the file.
+  web.on("/setblock", []() {
+    if (!requireAuth()) return;
+    setCustomFromText(web.arg("d"));
+    web.send(200, "text/plain", String(numCustom));
+  });
+  web.on("/sethosts", []() {
+    if (!requireAuth()) return;
+    setHostsFromText(web.arg("d"));
+    web.send(200, "text/plain", String(numHosts));
+  });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
     if (!requireAuth()) return;
     long s = web.hasArg("s") ? web.arg("s").toInt() : 0;
@@ -810,8 +960,6 @@ void setup() {
     web.send(200, "text/plain", "paused");
   });
   web.on("/resume", []() { if (!requireAuth()) return; blockingOn = true; resumeAt = 0; web.send(200, "text/plain", "resumed"); });
-  web.on("/forgetwifi", []() { if (!requireAuth()) return; web.send(200, "text/plain", "cleared — rebooting into setup portal");
-    prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
   web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
@@ -820,6 +968,10 @@ void setup() {
     if (web.hasArg("u")) updateUrl = web.arg("u");
     if (web.hasArg("h")) { updateIntervalH = web.arg("h").toInt(); if (updateIntervalH < 1) updateIntervalH = 1; }
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
+  });
+  web.onNotFound([]() {
+    if (web.uri() == "/favicon.ico" || web.uri() == "/apple-touch-icon.png") { web.send(204, "text/plain", ""); return; }
+    web.send(404, "text/plain", "not found");
   });
   web.begin();
   ArduinoOTA.setHostname("s3adblock");   // pio run -t upload --upload-port s3adblock.local

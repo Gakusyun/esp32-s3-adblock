@@ -12,6 +12,10 @@
 # Generated blocklist (build it with tools/build_blocklist.py)
 data/blocklist.bin
 
+# Dashboard build inputs/outputs (data/index.html.gz IS committed: it's the shipped page)
+web/node_modules/
+web/dist/
+
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h
 

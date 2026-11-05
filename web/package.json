@@ -1,0 +1,17 @@
+{
+  "name": "s3-adblock-ui",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Dashboard for the ESP32-S3 DNS ad-blocker (Preact + Tailwind, bundled into one gzipped HTML served from LittleFS)",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.11",
+    "esbuild": "^0.25.0",
+    "preact": "^10.26.0",
+    "tailwindcss": "^4.1.11"
+  }
+}

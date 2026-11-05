@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+/* 全局唯一允许的自定义 CSS：隐藏滚动条（与 salary-calc 的做法一致） */
+html {
+  scrollbar-width: none;
+}
+html::-webkit-scrollbar {
+  display: none;
+}
