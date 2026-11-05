@@ -55,7 +55,7 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
   （典型 **~110B**，不是每槽固定预 512B），已用字节实时记账，**不会溢出**。
   唯一的硬上限是**表项数 1024**（`DNS_CACHE_SLOTS`）：
   单条最大 `512 + 288` 字节，所以 1024 条最多占 ~800KB，典型只有 ~110KB。
-  槽位表本身（1024 × 34B ≈ 34KB）在**开机时从 PSRAM 分配**，不再占内部 RAM；
+  槽位表本身（1024 × 28B ≈ 28KB）在**开机时从 PSRAM 分配**，不再占内部 RAM；
   想让缓存更大就调 `DNS_CACHE_SLOTS`，用 `/stats.json` 的 `dnsCacheN` / `dnsCacheBytes` 观察。
 - **查找 / 淘汰都是 O(1)**：256 个桶的链式哈希 + 侵入式 LRU 链表。
   > 早先这里是“线性扫 1024 槽找命中”，淘汰还要再扫两遍挑“TTL 最接近过期”的，
@@ -241,8 +241,11 @@ https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-
 - 面板「规则」页可以改 URL、**每天几点更新**、时区，或点「立即拉取」（立即返回，
   进度看「上次」/`upbusy`）。
 - **替换是原子的**：新表先写进临时文件（`/blupdate.new` 或 `/blocklist.new`），校验
-  （非空、5 字节整数倍、**严格有序**、`Content-Length` 对得上）之后才 `rename()` 覆盖旧的。
+  （非空、5 字节整数倍、**有序**、`Content-Length` 对得上）之后才 `rename()` 覆盖旧的。
   所以下载被截断、证书失效、写满、断电都不会把正在用的规则表弄没（旧版本是**先删再写**）。
+- 下载用 `HTTPClient::writeToStream()` 而不是裸 socket：**chunked 传输会自动解块**，
+  分块边界不会混进文本解析器；截断的分块流会返回错误而不是被当成“有序的前缀”收下。
+  chunked 没有总长度可比对，所以 `/stats.json` 仍会标 `fetchChunked`。
 - 规则表被替换（远程拉取 / 网页上传）时**清空一次 DNS 缓存**：旧答案可能指向新规则要拦的域名。
 - 设备端支持的格式（与 `tools/build_blocklist.py` 保持一致）：
   - hosts：`0.0.0.0 ads.example.com`、`127.0.0.1 x`、`:: x`（一行多个域名也支持）
@@ -276,7 +279,7 @@ curl -i http://<设备IP>/        # 面板
 | `dnsHit` / `dnsMiss` | DNS 缓存命中 / 未命中 |
 | `dnsCacheN` / `dnsCacheBytes` / `dnsCacheCap` / `dnsEvict` | 缓存条目数 / 占用 PSRAM / 槽位上限 / 淘汰次数 |
 | `blBytes` / `blIndex` / `blCap` | 规则表字节数 / 一级索引条目数 / 分区能放的条数上限 |
-| `blIndexErr` / `blStreams` | 建索引失败的读次数（非 0 = 本次开机不拦截）/ 需要多读一段的桶数 |
+| `blIndexErr` / `blStreams` | 建索引失败（读失败或 PSRAM 不足；非 0 = 本次开机不拦截）/ 需要多读一段的查询次数 |
 | `fsUsed` / `fsTotal` | LittleFS 已用 / 总容量 |
 | `epoch` | 当前时间戳（仍停在 1970 → NTP 没同步，规则拉取会不校验证书） |
 | `build` / `idf` / `cpu` | 固件编译时间 / ESP-IDF 版本 / CPU 频率（用来确认 OTA 真的生效） |
@@ -285,7 +288,7 @@ curl -i http://<设备IP>/        # 面板
 | `dohState` / `dohBackoffS` / `dohFallback` | DoH 实际状态 / 退避剩余秒数 / 降级到 UDP 的次数 |
 | `clientN` / `banN` / `customN` / `hostN` | 客户端 / 封禁 / 自定义屏蔽 / Hosts 条数 |
 | `customCap` / `hostCap` | 自定义屏蔽 / Hosts 的条数上限（面板直接用它，不写死） |
-| `fetchChunked` | 上次拉取是 chunked 传输（长度无法校验，只有日志提示） |
+| `fetchChunked` | 上次拉取是 chunked 传输（分块边界已校验，但服务器没有给出总长度） |
 | `clients[].age` | 该客户端距离上次查询多少秒（判断表项是否过时） |
 
 > 面板「可用内存」显示的是 `heap`（**内部 SRAM**，100～200KB 是正常值）；8MB PSRAM 是独立
@@ -324,7 +327,8 @@ curl -s http://<设备IP>/stats.json | grep -o '"dnsH[^,]*,"dnsM[^,]*'   # 命�
 - 面板/OTA 都是明文 HTTP；局域网信任边界内的防护，不是加密方案。
 - `/stats.json` 不鉴权（内网只读），里面有每个客户端的 IP/MAC、自定义屏蔽与 Hosts 表。
 - 默认上游是**明文 UDP DNS**（可被链路上的中间人改写/投毒），想防就开 DoH（见上）。
-  规则拉取用 CA 校验，但**没有 NTP 时会降级不校验**（面板会提示 `fetchInsecure`）。
+  规则拉取用 CA 校验，但**没有 NTP 时会降级不校验**；规则 URL 写成 `http://` 时
+  同样没有证书校验，两者都会让 `fetchInsecure` 为 true。
 - DNS 应答已按 EDNS 规范重建（只带 question + 1 条 answer，ARCOUNT=0），
   个别客户端若仍异常，优先怀疑上游/DNS 报文被中间设备改写。
 - 上游转发在解析器里是阻塞等待（最多 1s），等待期间会穿插 `web.handleClient()`，

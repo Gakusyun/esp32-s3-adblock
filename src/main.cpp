@@ -77,7 +77,7 @@ static const char* BLOCKLIST_PATH = "/blocklist.bin";
 static const char* BL_TMP_UPLOAD = "/blocklist.new";   // written by /upload (browser)
 static const char* BL_TMP_REMOTE = "/blupdate.new";    // written by the update task
 static const char* BL_OLD        = "/bl.old";          // previous list, parked during a swap
-// 11.75 MB LittleFS / 5 bytes per entry, minus metadata.
+// 11.94 MiB LittleFS / 5 bytes per entry, minus metadata.
 static const uint32_t FLASH_HASH_CAPACITY = 2400000;
 static const int HASH_BYTES = 5;
 static const uint64_t HASH_MASK = (1ULL << (HASH_BYTES * 8)) - 1;
@@ -119,7 +119,7 @@ static uint8_t* blArena = nullptr;       // one PSRAM block: [index][range buffe
 static uint8_t* blIndex = nullptr;       // -> blArena, indexEntries * HASH_BYTES
 static uint8_t* rangeBuf = nullptr;      // -> after the index, MAX_RANGE * HASH_BYTES
 static uint32_t blIndexErrors  = 0;      // flash reads that failed in buildFlashIndex()
-static uint32_t blRangeStreams = 0;      // buckets that needed more than one chunk
+static uint32_t blRangeStreams = 0;      // lookups whose bucket needed more than one chunk
 static uint8_t cacheKey[CACHE_SIZE][HASH_BYTES];
 static uint8_t cacheRes[CACHE_SIZE];
 static uint8_t cacheValid[CACHE_SIZE];
@@ -142,7 +142,7 @@ struct DnsCacheEnt {
   int16_t  lnext;     // LRU list: next (less recently used)
   uint8_t* pkt;       // pkt[0..len) = reply, pkt[len..len+keyLen) = key; nullptr = free
 };
-// The table itself (~34 KB for 1024 slots) is allocated in PSRAM at boot: it used to be a
+// The table itself (~28 KB for 1024 slots) is allocated in PSRAM at boot: it used to be a
 // static array and was the single biggest consumer of internal SRAM in this project.
 static DnsCacheEnt* dnsCache = nullptr;
 static const int CACHE_BUCKETS = 256;          // power of 2; hash chains (1024 slots)
@@ -263,7 +263,11 @@ static void buildFlashIndex() {
   const size_t idxBytes = (size_t)want * HASH_BYTES;
   const size_t rangeBytes = (size_t)MAX_RANGE * HASH_BYTES;
   blArena = (uint8_t*)heap_caps_malloc(idxBytes + rangeBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!blArena) { Serial.println("[bl] WARN no PSRAM for the index -> lookups go unfiltered"); return; }
+  if (!blArena) {
+    blIndexErrors++;    // without this, stats showed blIndex=0/blIndexErr=0 for an allocation failure
+    Serial.println("[bl] WARN no PSRAM for the index -> lookups go unfiltered");
+    return;
+  }
   blIndex = blArena;
   rangeBuf = blArena + idxBytes;
 
@@ -311,7 +315,7 @@ static bool inFlash(uint64_t h) {
   uint32_t startPos = (uint32_t)((uint64_t)seg * (numHashes - 1) / (uint32_t)(indexEntries - 1));
   uint32_t endPos   = (uint32_t)((uint64_t)(seg + 1) * (numHashes - 1) / (uint32_t)(indexEntries - 1));
   if (endPos >= numHashes) endPos = numHashes - 1;
-  if (endPos - startPos + 1 > (uint32_t)MAX_RANGE) blRangeStreams++;   // visible in stats
+  if (endPos - startPos + 1 > (uint32_t)MAX_RANGE) blRangeStreams++;   // lookups whose bucket needed >1 read
 
   // Stream the bucket in chunks. The old code clamped the count to MAX_RANGE and
   // returned false for anything past it, so with a very large list a few buckets were
@@ -396,7 +400,7 @@ static bool normDomain(const String& in, String& out) {
   int slash = s.indexOf('/'); if (slash >= 0) s = s.substring(0, slash);
   while (s.length() && (s[0] == '*' || s[0] == '.')) s = s.substring(1);
   while (s.length() && s[s.length() - 1] == '.') s = s.substring(0, s.length() - 1);
-  if (s.startsWith("www.") && s.length() > 8) s = s.substring(4);
+  if (s.startsWith("www.") && s.length() > 4) s = s.substring(4);   // same rule as parseQuery/addRuleDomain
   if (s.length() < 3 || s.length() > 253 || s.indexOf('.') < 0) return false;
   for (size_t i = 0; i < s.length(); i++) {
     char c = s[i];
@@ -432,7 +436,16 @@ static void loadCustom() {
   }
   f.close();
 }
-static void saveCustom() { File f = LittleFS.open("/custom.txt", "w"); if (!f) return; for (int i = 0; i < numCustom; i++) f.println(customDom[i]); f.close(); }
+// Returns false when the file could not be opened or a line could not be written:
+// the caller used to answer 200 regardless, so a full/failing flash looked like a
+// successful save and the list silently reverted on the next boot.
+static bool saveCustom() {
+  File f = LittleFS.open("/custom.txt", "w"); if (!f) return false;
+  bool ok = true;
+  for (int i = 0; i < numCustom; i++) if (f.println(customDom[i]) == 0) { ok = false; break; }
+  f.close();
+  return ok;
+}
 
 // ---------- on-board RGB LED ----------
 // Status colours: blue = booting / no Wi-Fi, green = blocking, amber = paused.
@@ -456,7 +469,12 @@ static void loadLedCfg() {
   String v = f.readStringUntil('\n'); v.trim(); f.close();
   if (v.length()) ledOn = v.toInt() != 0;
 }
-static void saveLedCfg() { File f = LittleFS.open("/led.cfg", "w"); if (!f) return; f.println(ledOn ? 1 : 0); f.close(); }
+static bool saveLedCfg() {
+  File f = LittleFS.open("/led.cfg", "w"); if (!f) return false;
+  const bool ok = f.println(ledOn ? 1 : 0) > 0;
+  f.close();
+  return ok;
+}
 // Replace the whole list from the textarea contents. Accepts one domain per line,
 // hosts-file lines ("0.0.0.0 a b c"), and # comments — anything that is not a
 // domain token is ignored, so pasting a full hosts file just works.
@@ -522,10 +540,15 @@ static void loadHosts() {
   }
   f.close();
 }
-static void saveHosts() {
-  File f = LittleFS.open("/hosts.txt", "w"); if (!f) return;
-  for (int i = 0; i < numHosts; i++) { IPAddress ip(hostEnt[i].ip); f.println(hostEnt[i].dom + " " + ip.toString()); }
+static bool saveHosts() {
+  File f = LittleFS.open("/hosts.txt", "w"); if (!f) return false;
+  bool ok = true;
+  for (int i = 0; i < numHosts; i++) {
+    IPAddress ip(hostEnt[i].ip);
+    if (f.println(hostEnt[i].dom + " " + ip.toString()) == 0) { ok = false; break; }
+  }
   f.close();
+  return ok;
 }
 // Same contract as setCustomFromText(): built in place, -1 (and the flash copy
 // reloaded) when there are more than MAX_HOSTS distinct mappings.
@@ -1044,9 +1067,10 @@ static void dnsClampUdpSize(uint8_t* q, int qlen, int qend) {
 // (drops the caller's OPT record, clamps TTLs), so the caller must send exactly this
 // many bytes. It used to return void while shortening the packet, which left ARCOUNT=0
 // with the OPT bytes still trailing in the datagram sent to the client.
-static int dnsCacheStore(int qend, int n, uint32_t h, int klen) {
+static int dnsCacheStore(int n, uint32_t h, int klen) {
   if (!dnsCache || klen <= 0 || n < 13 || n > DNS_CACHE_MAXLEN) return n;
   if ((buf[3] & 0x0F) != 0) return n;                       // rcode != NOERROR
+  if (buf[2] & 0x02) return n;                              // TC=1: truncated, not a complete answer
   if ((((uint16_t)buf[6] << 8) | buf[7]) == 0) return n;    // ANCOUNT == 0
   // One pass: drop the caller's EDNS OPT and clamp the TTLs to DNS_CACHE_MAX_TTL.
   int32_t ttl = -1;
@@ -1056,35 +1080,28 @@ static int dnsCacheStore(int qend, int n, uint32_t h, int klen) {
 
   const size_t need = (size_t)n + (size_t)klen;             // exact size of this entry
   const uint32_t now = millis();
-  int slot = dnsCacheFind(h, klen);
-  bool fresh = false;
-  if (slot >= 0 && dnsCache[slot].cap < need) { dnsCacheDrop(slot); slot = -1; }  // too small
-  if (slot < 0) {
-    slot = dnsCacheSlot();
-    if (slot < 0) return n;
-    // heap_caps_malloc, not ps_malloc(): arduino-esp32's ps_malloc() gates on its own
-    // "PSRAM is up" flag, which the precompiled opi libs never set here — the PSRAM
-    // region is in the heap (heap_caps sees the full 8MB) but ps_malloc() returns NULL.
-    uint8_t* p = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) return n;                                       // PSRAM exhausted -> run uncached
-    memset(&dnsCache[slot], 0, sizeof(DnsCacheEnt));
-    dnsCache[slot].pkt = p;
-    dnsCache[slot].cap = (uint16_t)need;
-    dnsCacheBytes += need;
-    fresh = true;
-  }
+  // Always a fresh slot: dnsCacheLookup() ran for this same key right before the
+  // upstream round trip, so any matching entry was either returned as a hit or
+  // already dropped (expired / unparsable). The old "reuse an existing slot" branch
+  // could therefore never be taken and kept a second copy of this logic around.
+  const int slot = dnsCacheSlot();
+  if (slot < 0) return n;
+  // heap_caps_malloc, not ps_malloc(): arduino-esp32's ps_malloc() gates on its own
+  // "PSRAM is up" flag, which the precompiled opi libs never set here — the PSRAM
+  // region is in the heap (heap_caps sees the full 8MB) but ps_malloc() returns NULL.
+  uint8_t* p = (uint8_t*)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) return n;                                         // PSRAM exhausted -> run uncached
+  memset(&dnsCache[slot], 0, sizeof(DnsCacheEnt));
   DnsCacheEnt& e = dnsCache[slot];
+  e.pkt = p;
+  e.cap = (uint16_t)need;
+  dnsCacheBytes += need;
   memcpy(e.pkt, buf, n);
   memcpy(e.pkt + n, dnsKeyBuf, klen);
   e.sig = h; e.keyLen = (uint16_t)klen; e.len = (uint16_t)n;
   e.storedMs = now; e.expireS = (uint32_t)ttl;
-  if (fresh) {
-    const int b = (int)(h & (CACHE_BUCKETS - 1));
-    e.hnext = cacheHead[b]; cacheHead[b] = (int16_t)slot;
-    e.lprev = e.lnext = -1;
-  } else {
-    cacheLruUnlink(slot);
-  }
+  const int b = (int)(h & (CACHE_BUCKETS - 1));
+  e.hnext = cacheHead[b]; cacheHead[b] = (int16_t)slot;
   cacheLruFront(slot);
   return n;
 }
@@ -1103,7 +1120,7 @@ static void dnsCacheFlush() {
   if (!dnsCache) return;
   for (int i = 0; i < DNS_CACHE_SLOTS; i++) dnsCacheDrop(i);
 }
-// Allocate the slot table itself: ~34 KB for 1024 slots, so PSRAM, not internal RAM.
+// Allocate the slot table itself: ~28 KB for 1024 slots, so PSRAM, not internal RAM.
 static void dnsCacheInit() {
   dnsCache = (DnsCacheEnt*)heap_caps_malloc(sizeof(DnsCacheEnt) * DNS_CACHE_SLOTS,
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1128,15 +1145,20 @@ static bool handleDns() {
     char domain[256]; uint16_t qtype = 0; int qend = qlen;
     size_t dl = parseQuery(buf, qlen, domain, &qtype, &qend);
     Dev* c = getClient((uint32_t)cip);
-    bool ban = c && c->banned;
+    const bool ban = c->banned;
+    // No parsable question: qend is still qlen, so building a reply would mutate the
+    // header and leave the trailing bytes intact — a malformed answer. A banned client
+    // is simply dropped; anyone else gets the query forwarded as before.
+    if (!dl && ban) continue;
     // A ban is absolute: a banned device gets sinkhole answers even for names that
     // have an explicit hosts mapping (the mapping used to win).
-    bool blocked = ban || (blockingOn && dl && isBlocked(domain));
+    bool blocked = dl && (ban || (blockingOn && isBlocked(domain)));
     uint32_t mapped = (!blocked && dl) ? hostsLookup(domain) : 0;
     // NB: no `numHashes &&` here. The custom list is checked in RAM and has nothing
     // to do with the flash blob; gating on it made custom domains silently useless
     // whenever /blocklist.bin was missing (fresh flash, failed update, ...).
     int rlen;
+    bool forwarded = false;
     if (mapped)  { rlen = buildAnswer(qend, qtype, mapped);       totalAllowed++; if (c) c->allowed++; }
     else if (blocked) { rlen = buildBlocked(qend, qtype); totalBlocked++; if (c) c->blocked++; }
     else {
@@ -1155,13 +1177,19 @@ static bool handleDns() {
       if (rlen <= 0) {
         if (dl) dnsCacheMiss++;
         const int r = forwardUpstream(qlen, haveQ ? dnsQSave + 12 : nullptr, haveQ ? qend - 12 : 0);
-        rlen = (r > 0 && klen > 0) ? dnsCacheStore(qend, r, kh, klen) : r;   // store() may shorten buf
+        forwarded = true;
+        rlen = (r > 0 && klen > 0) ? dnsCacheStore(r, kh, klen) : r;   // store() may shorten buf
         if (rlen > 0) { totalAllowed++; if (c) c->allowed++; }      // only count answers we got
       } else {
         totalAllowed++; if (c) c->allowed++;
       }
     }
     if (rlen > 0) { dnsServer.beginPacket(cip, cport); dnsServer.write(buf, rlen); dnsServer.endPacket(); }
+    // A forward can block for seconds (DoH: connect + handshake + two 5 s attempts,
+    // then a 1 s UDP fallback). Finishing the 8-packet batch after that stalled
+    // ArduinoOTA, the update poll and the pause/LED timers for many seconds. Local
+    // answers and cache hits still drain in batches; only forwarding ends the turn.
+    if (forwarded) break;
   }
   return did;
 }
@@ -1270,7 +1298,7 @@ static void handleStats() {
              ",\"blBytes\":" + (uint32_t)(blocklist ? blocklist.size() : 0) +
              ",\"blIndex\":" + indexEntries + ",\"blCap\":" + (uint32_t)FLASH_HASH_CAPACITY +
              // Non-zero blIndexErr = the index could not be rebuilt (blocking is off);
-             // blStreams counts buckets that needed more than one flash read.
+             // blStreams counts lookups whose bucket needed more than one flash read.
              ",\"blIndexErr\":" + blIndexErrors + ",\"blStreams\":" + blRangeStreams +
              ",\"fsUsed\":" + (uint32_t)LittleFS.usedBytes() + ",\"fsTotal\":" + (uint32_t)LittleFS.totalBytes() +
              ",\"clientN\":" + numClients + ",\"banN\":" + numBanned +
@@ -1395,11 +1423,11 @@ static bool blocklistIsValid(File& f, uint32_t* outN, const char** why) {
 // and renamed back if the second step fails. Nothing is ever deleted before a
 // validated replacement exists, and setup() restores /bl.old after a power cut.
 
-static bool applyBlocklist(const char* tmpPath, bool preValidated = false, uint32_t preCount = 0) {
+static bool applyBlocklist(const char* tmpPath, bool preValidated = false) {
   if (!preValidated) {
     File f = LittleFS.open(tmpPath, "r");
     if (!f) { updateStatus = "temp file missing"; return false; }
-    uint32_t n = preCount;
+    uint32_t n = 0;
     const char* why = "?";
     const bool ok = blocklistIsValid(f, &n, &why);
     f.close();
@@ -1434,6 +1462,31 @@ static bool upOk = false;
 static bool upAuthOk = false;
 static bool upWriteErr = false;
 static File upFile;
+// Incremental validation of the uploaded hash blob. blocklistIsValid() used to
+// re-read the whole temp file on the main task right after the upload finished,
+// stalling DNS for the file size (up to ~12 MB). The blob is sorted, so sortedness,
+// 5-byte alignment and the partition cap can be checked while the bytes arrive.
+static size_t   upBytes = 0;
+static uint8_t  upCarry[HASH_BYTES];      // partial entry carried across chunks
+static size_t   upCarryN = 0;
+static uint64_t upPrevHash = 0;
+static bool     upHavePrev = false, upSorted = true, upTooBig = false;
+
+static void upValidate(const uint8_t* p, size_t n) {
+  if (!upSorted || upTooBig) return;
+  while (n && upCarryN < HASH_BYTES) { upCarry[upCarryN++] = *p++; n--; }
+  if (upCarryN == HASH_BYTES) {
+    const uint64_t v = unpackHash(upCarry);
+    if (upHavePrev && v < upPrevHash) { upSorted = false; return; }
+    upPrevHash = v; upHavePrev = true; upCarryN = 0;
+  }
+  while (n >= HASH_BYTES) {
+    const uint64_t v = unpackHash(p);
+    if (upHavePrev && v < upPrevHash) { upSorted = false; return; }
+    upPrevHash = v; upHavePrev = true; p += HASH_BYTES; n -= HASH_BYTES;
+  }
+  if (n) { memcpy(upCarry, p, n); upCarryN = n; }
+}
 static void handleUploadDone() {
   if (!upAuthOk) { web.requestAuthentication(); return; }
   web.send(upOk ? 200 : 500, "text/plain", upOk ? "ok" : updateStatus);
@@ -1445,32 +1498,46 @@ static void handleUpload() {
       upAuthOk = web.header(CSRF_HEADER) == CSRF_VALUE && web.authenticate(WEB_USER, WEB_PASS);
       if (!upAuthOk) { Serial.println("[ota] blocklist upload: auth/CSRF check failed"); break; }
       upOk = false; upWriteErr = false;
+      upBytes = 0; upCarryN = 0; upHavePrev = false; upSorted = true; upTooBig = false;
       upFile = LittleFS.open(BL_TMP_UPLOAD, "w");      // live list keeps working meanwhile
       Serial.printf("[ota] receiving %s\n", u.filename.c_str());
-      if (!upFile) Serial.println("[ota] cannot create the temp file");
+      if (!upFile) {
+        upWriteErr = true;
+        Serial.println("[ota] cannot create the temp file");
+      }
       break;
     case UPLOAD_FILE_WRITE:
       // A short write leaves a truncated temp file, and a truncated hash blob is still
-      // "non-empty, 5-aligned and sorted" — i.e. it passes blocklistIsValid() and would
-      // silently shrink the rule set. fetchBin() always checked this; this path did not.
-      if (upAuthOk && upFile && !upWriteErr && upFile.write(u.buf, u.currentSize) != u.currentSize) {
+      // "non-empty, 5-aligned and sorted" — i.e. it would silently shrink the rule set.
+      if (!upAuthOk) break;
+      if (upFile && !upWriteErr && upFile.write(u.buf, u.currentSize) != u.currentSize) {
         upWriteErr = true;
         Serial.println("[ota] write failed (flash full?) -> upload rejected");
       }
+      upBytes += u.currentSize;
+      if (upBytes > (size_t)FLASH_HASH_CAPACITY * HASH_BYTES) { upTooBig = true; break; }
+      if (!upWriteErr) upValidate(u.buf, u.currentSize);
       break;
-    case UPLOAD_FILE_END:
+    case UPLOAD_FILE_END: {
       if (!upAuthOk) break;
       if (upFile) upFile.close();
-      if (upWriteErr) {
+      const char* why = nullptr;
+      if (upWriteErr)        why = "write error (flash full?)";
+      else if (upBytes == 0) why = "empty file";
+      else if (upBytes % HASH_BYTES) why = "size is not a multiple of 5";
+      else if (!upSorted)    why = "not sorted";
+      else if (upTooBig)     why = "larger than the partition";
+      if (why) {
         LittleFS.remove(BL_TMP_UPLOAD);
         upOk = false;
-        updateStatus = "upload failed: write error (flash full?)";
-        Serial.println("[ota] rejected: write error");
+        updateStatus = String("upload rejected: ") + why;
+        Serial.printf("[ota] rejected: %s\n", why);
         break;
       }
-      upOk = applyBlocklist(BL_TMP_UPLOAD);
+      upOk = applyBlocklist(BL_TMP_UPLOAD, true);
       Serial.printf("[ota] %s -> %u domains\n", upOk ? "OK" : "REJECTED", (unsigned)numHashes);
       break;
+    }
     case UPLOAD_FILE_ABORTED:
       if (!upAuthOk) break;
       if (upFile) upFile.close();
@@ -1516,42 +1583,70 @@ static void tlsForFetch(WiFiClientSecure& cs) {
   }
 }
 
+// Download the response body into `out`. HTTPClient::writeToStream() is the only
+// path that de-chunks (and the one that reports a truncated chunked body as an
+// error). A body with neither Content-Length nor chunked encoding keeps the old
+// idle-timeout loop: writeToStreamDataBlock() has no deadline, so it would spin
+// forever on a connection the server leaves open.
+static int downloadBody(HTTPClient& http, Stream* out) {
+  const int len = http.getSize();
+  if (len >= 0 || http.header("Transfer-Encoding").equalsIgnoreCase("chunked"))
+    return http.writeToStream(out);
+  uint8_t b[512]; size_t total = 0; uint32_t idle = millis();
+  WiFiClient* stream = http.getStreamPtr();
+  while (http.connected()) {
+    const size_t avail = stream->available();
+    if (!avail) { if (millis() - idle > 15000) break; delay(2); continue; }
+    const int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
+    if (n <= 0) continue;
+    idle = millis();
+    if (out->write(b, (size_t)n) != (size_t)n) return HTTPC_ERROR_STREAM_WRITE;
+    total += (size_t)n;
+  }
+  return (int)total;
+}
+
 // A prebuilt hash blob: streamed into the temp file (legacy path, *.bin URLs).
 static bool fetchBin(const String& url) {
   Serial.printf("[remote] GET bin %s\n", url.c_str());
-  WiFiClientSecure cs; tlsForFetch(cs);
-  WiFiClient cl;
+  WiFiClientSecure cs; WiFiClient cl;
+  const bool https = url.startsWith("https");
+  if (https) tlsForFetch(cs); else fetchSecure = false;   // plain http: nothing to verify
+  chunkedFetch = false;
   HTTPClient http; http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // GitHub release -> CDN redirect
-  const bool https = url.startsWith("https");
+  const char* hdrs[] = {"Transfer-Encoding"};
+  http.collectHeaders(hdrs, 1);                            // downloadBody() needs to tell chunked from close-delimited
   if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { fetchStatus = "begin failed"; return false; }
   const int code = http.GET();
   if (code != HTTP_CODE_OK) { http.end(); fetchStatus = "HTTP " + String(code); return false; }
   File f = LittleFS.open(BL_TMP_REMOTE, "w");
   if (!f) { http.end(); fetchStatus = "fs open failed"; return false; }
-  WiFiClient* stream = http.getStreamPtr();
-  const int len = http.getSize();                          // -1 = chunked / unknown
-  uint8_t b[1024]; size_t total = 0; uint32_t idle = millis();
-  bool writeErr = false;
-  while (!writeErr && http.connected() && (len < 0 || (int)total < len)) {
-    const size_t avail = stream->available();
-    if (avail) {
-      const int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
-      if (n > 0) {
-        if (f.write(b, (size_t)n) != (size_t)n) writeErr = true;   // flash full / FS error
-        total += (size_t)n; idle = millis();
-      }
-    } else { if (millis() - idle > 15000) break; delay(2); }
-  }
+  const int len = http.getSize();                          // -1 = chunked / no Content-Length
+  const bool chunked = http.header("Transfer-Encoding").equalsIgnoreCase("chunked");
+  const int got = downloadBody(http, &f);
   f.close(); http.end();
-  if (writeErr) { LittleFS.remove(BL_TMP_REMOTE); fetchStatus = "write failed (flash full?)"; return false; }
-  // A truncated body is indistinguishable from a valid prefix once it is on flash,
-  // so a length we cannot verify — and a byte count that doesn't match — reject it.
-  if (len < 0) { LittleFS.remove(BL_TMP_REMOTE); fetchStatus = "chunked body, size unverifiable"; return false; }
-  if ((int)total != len) {
+  if (got < 0) {
     LittleFS.remove(BL_TMP_REMOTE);
-    fetchStatus = "short download (" + String((unsigned)total) + "/" + String(len) + "B)";
+    fetchStatus = "download/write failed (" + String(got) + ")";
     return false;
+  }
+  if (got == 0) { LittleFS.remove(BL_TMP_REMOTE); fetchStatus = "empty body"; return false; }
+  // A close-delimited body (no Content-Length and not chunked) gives us no way to
+  // detect truncation; a hash blob is worthless without that check.
+  if (len < 0 && !chunked) {
+    LittleFS.remove(BL_TMP_REMOTE);
+    fetchStatus = "size unverifiable (no length, not chunked)";
+    return false;
+  }
+  if (!chunked && got != len) {
+    LittleFS.remove(BL_TMP_REMOTE);
+    fetchStatus = "short download (" + String((unsigned)got) + "/" + String(len) + "B)";
+    return false;
+  }
+  if (chunked) {
+    chunkedFetch = true;
+    Serial.println("[remote] WARN chunked body: framing verified, total length unknown");
   }
   return true;
 }
@@ -1705,57 +1800,80 @@ static bool writeRuleBlob(size_t bytesRead) {
   return true;
 }
 
-static bool fetchRuleText(const String& url) {
-  Serial.printf("[remote] GET rules %s\n", url.c_str());
-  WiFiClientSecure cs; tlsForFetch(cs);
-  WiFiClient cl;
-  HTTPClient http; http.setTimeout(25000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  const bool https = url.startsWith("https");
-  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { fetchStatus = "begin failed"; return false; }
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK) { http.end(); fetchStatus = "HTTP " + String(code); return false; }
-
-  ruleCount = 0; allowCount = 0; ruleSkipped = 0; ruleOom = false; chunkedFetch = false;
-  WiFiClient* stream = http.getStreamPtr();
-  const int len = http.getSize();
-  char line[320]; size_t ll = 0; bool ovf = false;
-  uint8_t b[512]; size_t total = 0; uint32_t idle = millis();
-  while (http.connected() && (len < 0 || (int)total < len)) {
-    const size_t avail = stream->available();
-    if (!avail) { if (millis() - idle > 15000) break; delay(2); continue; }
-    const int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
-    if (n <= 0) continue;
-    idle = millis(); total += (size_t)n;
-    for (int i = 0; i < n && !ruleOom; i++) {
-      const char c = (char)b[i];
+// Sink for HTTPClient::writeToStream(): it receives the *de-chunked* body, so chunk
+// framing never reaches the line parser. getStreamPtr() is the raw socket (HTTPClient
+// only de-chunks in writeToStream()/getString()), so jsDelivr's chunked rules file used
+// to feed "1a2b\r\n" boundaries into parseRuleLine() — mangling domains around every
+// boundary — and a truncated transfer still looked like a valid (sorted-prefix) list.
+class RuleSink : public Stream {
+ public:
+  size_t write(uint8_t c) override { return write(&c, 1); }
+  size_t write(const uint8_t* p, size_t n) override {
+    if (ruleOom) { setWriteError(); return 0; }   // stop the download once the arena is full
+    feed(p, n);
+    if (ruleOom) { setWriteError(); return 0; }
+    return n;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+  void finish() {                                  // parse a final line without '\n'
+    if (ll && !ovf) { line[ll] = 0; parseRuleLine(line); }
+    ll = 0; ovf = false;
+  }
+ private:
+  void feed(const uint8_t* p, size_t n) {
+    for (size_t i = 0; i < n && !ruleOom; i++) {
+      const char c = (char)p[i];
       if (c == '\n') {
-        if (ovf) { ovf = false; ll = 0; }                 // over-long line (cosmetic junk) -> drop
+        if (ovf) { ovf = false; ll = 0; }           // over-long line (cosmetic junk) -> drop
         else { line[ll] = 0; parseRuleLine(line); ll = 0; }
       } else if (c != '\r') {
         if (ll < sizeof(line) - 1) line[ll++] = c; else ovf = true;
       }
     }
   }
+  char line[320]; size_t ll = 0; bool ovf = false;
+};
+
+static bool fetchRuleText(const String& url) {
+  Serial.printf("[remote] GET rules %s\n", url.c_str());
+  WiFiClientSecure cs; WiFiClient cl;
+  const bool https = url.startsWith("https");
+  if (https) tlsForFetch(cs); else fetchSecure = false;   // plain http: nothing to verify
+  HTTPClient http; http.setTimeout(25000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  const char* hdrs[] = {"Transfer-Encoding"};
+  http.collectHeaders(hdrs, 1);                    // downloadBody() needs to tell chunked from close-delimited
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { fetchStatus = "begin failed"; return false; }
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); fetchStatus = "HTTP " + String(code); return false; }
+
+  ruleCount = 0; allowCount = 0; ruleSkipped = 0; ruleOom = false; chunkedFetch = false;
+  const int len = http.getSize();                  // -1 = chunked / no Content-Length
+  const bool chunked = http.header("Transfer-Encoding").equalsIgnoreCase("chunked");
+  RuleSink sink;
+  const int got = downloadBody(http, &sink);       // de-chunks + validates the chunk framing
   http.end();
-  if (!ruleOom && ll && !ovf) { line[ll] = 0; parseRuleLine(line); }
+  sink.finish();
   if (ruleOom) { fetchStatus = "out of memory (list too big for the arena)"; return false; }
-  // A chunked body has no length to compare against, and an interrupted transfer is
-  // undetectable — but jsDelivr serves the built-in rules URL chunked, so rejecting it
-  // (the way fetchBin() does for .bin files) would break updates entirely. Accept it and
-  // say so instead of pretending the size was verified.
-  if (len < 0) {
-    chunkedFetch = true;
-    Serial.println("[remote] WARN chunked body: length cannot be verified");
-  } else if ((int)total != len) {
-    fetchStatus = "short download (" + String((unsigned)total) + "/" + String(len) + "B)";
+  if (got < 0) { fetchStatus = "download/write failed (" + String(got) + ")"; return false; }
+  if (!chunked && len >= 0 && got != len) {
+    fetchStatus = "short download (" + String((unsigned)got) + "/" + String(len) + "B)";
     return false;
   }
-  return writeRuleBlob(total);
+  chunkedFetch = chunked;
+  if (chunked)
+    Serial.println("[remote] WARN chunked body: framing verified, total length unknown");
+  else if (len < 0)
+    Serial.println("[remote] WARN connection-close body: length cannot be verified");
+  return writeRuleBlob((size_t)got);
 }
 
 static bool fetchRules(const String& url) {
   if (fetchRuleText(url)) return true;
+  if (ruleOom) return false;                       // the fallback would exhaust the same arena
   const String first = fetchStatus;
   if (url == RULE_URL && String(RULE_URL_FALLBACK) != url) {   // mirror only for the built-in URL
     Serial.printf("[remote] primary failed (%s) -> fallback\n", first.c_str());
@@ -1770,8 +1888,9 @@ static bool fetchBlocklist(const String& url) {
   String u = url; u.trim();
   if (!u.length()) { fetchStatus = "no url set"; return false; }
   const bool ok = u.endsWith(".bin") ? fetchBin(u) : fetchRules(u);
-  free(ruleHashes);  ruleHashes = nullptr;  ruleCap = 0;  ruleCount = 0;    // release the PSRAM arenas
-  free(allowHashes); allowHashes = nullptr; allowCap = 0; allowCount = 0;
+  // Release the PSRAM arenas (allocated with heap_caps_realloc -> use heap_caps_free).
+  heap_caps_free(ruleHashes);  ruleHashes = nullptr;  ruleCap = 0;  ruleCount = 0;
+  heap_caps_free(allowHashes); allowHashes = nullptr; allowCap = 0; allowCount = 0;
   Serial.printf("[remote] %s\n", fetchStatus.c_str());
   return ok;
 }
@@ -1784,7 +1903,6 @@ static bool fetchBlocklist(const String& url) {
 // one task only. Validating there (reading the whole file back) used to happen on the
 // main task, which stalled DNS for seconds right after every download.
 static String updUrlSnapshot;      // copied on the main task, read by the fetch task
-static uint32_t updN = 0;          // validated entry count
 static const char* updWhy = "?";   // validation failure reason
 static void updateTask(void* arg) {
   const String url = *(const String*)arg;
@@ -1793,12 +1911,13 @@ static void updateTask(void* arg) {
     File f = LittleFS.open(BL_TMP_REMOTE, "r");
     if (!f) { updOk = false; fetchStatus = "temp file missing"; }
     else {
-      const bool ok = blocklistIsValid(f, &updN, &updWhy);
+      uint32_t n = 0;               // validated entry count (the swap only needs "valid")
+      const bool ok = blocklistIsValid(f, &n, &updWhy);
       f.close();
       if (!ok) { updOk = false; fetchStatus = String("rejected: ") + updWhy; }
     }
   }
-  __sync_synchronize();              // publish fetchStatus/updN before updDone is seen
+  __sync_synchronize();              // publish fetchStatus/updOk before updDone is seen
   updDone = true;                    // published before updRunning clears, so the two
   updRunning = false;                // never race on a new task starting mid-collection
   vTaskDelete(nullptr);
@@ -1806,7 +1925,7 @@ static void updateTask(void* arg) {
 
 static bool startUpdateTask() {
   if (updRunning) return false;
-  updRunning = true; updDone = false; updOk = false; updN = 0;
+  updRunning = true; updDone = false; updOk = false;
   fetchStatus = "";
   // /setupdate may change updateUrl while a fetch is in flight, and a second task must
   // never look at this String, so the URL is copied here, on the main task.
@@ -1825,7 +1944,7 @@ static bool startUpdateTask() {
 static void updatePoll() {
   if (!updDone) return;
   updDone = false;
-  if (updOk && applyBlocklist(BL_TMP_REMOTE, true, updN)) {
+  if (updOk && applyBlocklist(BL_TMP_REMOTE, true)) {
     if (updDay > 0) { lastUpdateDay = updDay; saveUpdateCfg(); }   // remember the day across reboots
   } else {
     if (!updOk) updateStatus = fetchStatus.length() ? fetchStatus : String("failed");
@@ -2012,7 +2131,7 @@ void setup() {
     LittleFS.rename(BL_OLD, BLOCKLIST_PATH);
     Serial.println("[bl] restored the previous list from /bl.old");
   }
-  // The answer cache table (~34 KB) lives in PSRAM; see dnsCacheInit().
+  // The answer cache table (~28 KB) lives in PSRAM; see dnsCacheInit().
   dnsCacheInit();
   reopenBlocklist();
   if (numHashes) Serial.printf("blocklist: %u domains (%d index buckets)\n", (unsigned)numHashes, indexEntries);
@@ -2081,7 +2200,7 @@ void setup() {
       web.send(413, "text/plain", "too many domains (max " + String(MAX_CUSTOM) + "), nothing saved");
       return;
     }
-    saveCustom();
+    if (!saveCustom()) { web.send(500, "text/plain", "flash write failed; the list is active until reboot"); return; }
     web.send(200, "text/plain", String(n));
   });
   web.on("/sethosts", HTTP_POST, []() {
@@ -2092,7 +2211,7 @@ void setup() {
       web.send(413, "text/plain", "too many mappings (max " + String(MAX_HOSTS) + "), nothing saved");
       return;
     }
-    saveHosts();
+    if (!saveHosts()) { web.send(500, "text/plain", "flash write failed; the mappings are active until reboot"); return; }
     web.send(200, "text/plain", String(n));
   });
   web.on("/pause", []() {                    // /pause?s=300  (0 or absent = indefinite)
@@ -2107,7 +2226,9 @@ void setup() {
   web.on("/setled", []() {                  // /setled?s=0|1  (absent = toggle)
     if (!requireAuth()) return;
     ledOn = web.hasArg("s") ? web.arg("s").toInt() != 0 : !ledOn;
-    saveLedCfg(); applyLed();
+    const bool saved = saveLedCfg();
+    applyLed();
+    if (!saved) { web.send(500, "text/plain", "flash write failed; setting active until reboot"); return; }
     web.send(200, "text/plain", ledOn ? "on" : "off");
   });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)

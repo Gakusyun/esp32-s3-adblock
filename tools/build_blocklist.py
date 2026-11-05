@@ -31,6 +31,7 @@ DEFAULT_SOURCES = [
 
 # ||domain^  or  @@||domain^  optionally followed by $modifiers
 ADG = re.compile(r'^(@@)?\|\|([a-z0-9._-]+)\^?(\$.*)?$', re.I)
+DOMAIN = re.compile(r'[a-z0-9._-]+')
 
 ALLOW_MISSING = False
 
@@ -42,7 +43,16 @@ def fnv(b: bytes) -> int:
 
 def norm(d: str) -> str:
     d = d.strip().lower().lstrip('*').lstrip('.').rstrip('.')
-    return d[4:] if d.startswith('www.') else d
+    # Same rule as src/main.cpp (parseQuery / normDomain / addRuleDomain): only strip
+    # "www." when something is left, so www.a.b and www.a normalise identically on
+    # both paths.
+    return d[4:] if d.startswith('www.') and len(d) > 4 else d
+
+def valid(d: str) -> bool:
+    # Same acceptance test as addRuleDomain() in src/main.cpp. Without it the .bin
+    # carried hashes for tokens the device-side text parser rejects, so a list baked
+    # here and the same list fetched as text could block different domains.
+    return 3 <= len(d) <= 253 and '.' in d and DOMAIN.fullmatch(d) is not None
 
 def read_source(src: str) -> str:
     if os.path.exists(src):
@@ -77,7 +87,9 @@ def main():
                 if not ALLOW_MISSING: sys.exit(1)
                 continue
         for line in data.splitlines():
-            line = line.split('#', 1)[0].strip() if not line.lstrip().startswith(('||', '@@')) else line.strip()
+            # The firmware's parseRuleLine() strips comments on every line, including
+            # ||... and @@... rules; do the same so both paths read a line the same way.
+            line = line.split('#', 1)[0].strip()
             if not line or line[0] in '!/[':
                 continue
             # AdGuard / ABP basic rules: ||example.com^  and allow rules @@||example.com^
@@ -85,7 +97,9 @@ def main():
             if m:
                 if m.group(3):            # has $modifiers (client/dnstype/etc.) -> can't express, skip
                     skipped += 1; continue
-                (allow if m.group(1) else domains).add(norm(m.group(2)))
+                d = norm(m.group(2))
+                if valid(d):
+                    (allow if m.group(1) else domains).add(d)
                 continue
             if line.startswith(('||', '@@', '|')) or any(c in line for c in '^$*'):
                 skipped += 1; continue    # other adblock syntax (regex, wildcards, cosmetic) -> skip
@@ -96,7 +110,7 @@ def main():
                 entries = parts if len(parts) == 1 else []
             for d in entries:
                 d = norm(d)
-                if '.' in d and ' ' not in d:
+                if valid(d):
                     domains.add(d)
     if allow:
         before = len(domains); domains -= allow
