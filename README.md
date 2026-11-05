@@ -152,6 +152,10 @@ pio run -t uploadfs
 pio device monitor
 ```
 
+> `uploadfs` 会用 `data/` **重建整个 LittleFS**：面板上的自定义屏蔽 / Hosts 映射 /
+> 封禁列表 / 指示灯设置都会被清掉（规则表变回 `data/blocklist.bin` 里预置的那份）。
+> 只刷固件用 `pio run -t upload` 不会动文件系统。
+
 烧完设备会自动连 `secrets.h` 里的 WiFi，面板地址 **http://s3adblock.local**。
 WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlock-XXXX`**，
 手机连上去填 SSID/密码即可；想重新配网：**按住 BOOT(GPIO0) 再上电**（会清掉保存的 WiFi 并进配网门户）。
@@ -266,9 +270,11 @@ curl -i http://<设备IP>/        # 面板
 `ok: N domains` / `rejected: ...`）。DNS 侧：
 
 ```bash
-dig @<设备IP> doubleclick.net   # -> 0.0.0.0（被拦）
-dig @<设备IP> github.com        # -> 真实 IP（转发，UDP 第一次 ~40ms）
-dig @<设备IP> github.com        # -> 同样答案，第二次走缓存（<5ms，TTL 递减）
+# 注意：验证要用列表里真有的域名。AWAvenue 里是 ad.doubleclick.net，
+# 不带 ad. 的 doubleclick.net 不在列表里，不会被拦。
+dig @<设备IP> ad.doubleclick.net   # -> 0.0.0.0（被拦）
+dig @<设备IP> github.com           # -> 真实 IP（转发）
+dig @<设备IP> github.com           # -> 同样答案，第二次走缓存（TTL 递减）
 curl -s http://<设备IP>/stats.json | grep -o '"dnsH[^,]*,"dnsM[^,]*'   # 命中/未命中计数
 ```
 
