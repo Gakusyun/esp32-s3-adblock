@@ -339,6 +339,8 @@ function Overview({ stats, api, run, busy, ratio, total }) {
   const [dur, setDur] = useState(300);
   if (!stats) return <Card title="状态">正在读取设备状态…</Card>;
   const on = stats.blocking !== false;
+  const lookups = (stats.dnsHit || 0) + (stats.dnsMiss || 0);
+  const cacheRate = lookups ? Math.round((stats.dnsHit / lookups) * 100) : null;
   return (
     <>
       <Card
@@ -399,7 +401,8 @@ function Overview({ stats, api, run, busy, ratio, total }) {
           <Stat label="已拦截" value={fmt(stats.blocked)} sub={total ? `共 ${fmt(total)} 次查询` : '暂无查询'} tone="text-rose-500 dark:text-rose-400" />
           <Stat label="已放行" value={fmt(stats.allowed)} sub="转发上游成功" tone="text-emerald-600 dark:text-emerald-400" />
           <Stat label="规则条数" value={fmt(stats.domains)} sub={`自定义 ${fmt(stats.custom?.length || 0)} · Hosts ${fmt(stats.hosts?.length || 0)}`} />
-          <Stat label="客户端" value={fmt(stats.clients?.length || 0)} sub="按 IP 统计" />
+          <Stat label="缓存命中率" value={cacheRate !== null ? `${cacheRate}%` : '—'}
+                sub={`${fmt(stats.dnsHit)} 命中 · ${fmt(stats.dnsMiss)} 未命中`} tone="text-sky-600 dark:text-sky-400" />
         </div>
       </Card>
 
@@ -418,7 +421,7 @@ function Overview({ stats, api, run, busy, ratio, total }) {
       >
         <p className="break-all font-mono text-xs text-slate-500 dark:text-slate-400">{stats.upurl || '未设置'}</p>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
-          <span>间隔 {stats.upiv} 小时</span>
+          <span>每天 {String(stats.uphour ?? 3).padStart(2, '0')}:00 自动更新（UTC+{stats.uptz ?? 8}）</span>
           <span>上次：{stats.upstat || '从未'}</span>
         </div>
       </Card>
@@ -497,7 +500,8 @@ function Clients({ stats, api, run, busy }) {
 
 function Rules({ stats, api, run, busy }) {
   const [url, setUrl] = useState('');
-  const [iv, setIv] = useState(24);
+  const [hour, setHour] = useState(3);
+  const [tz, setTz] = useState(8);
   const [file, setFile] = useState(null);
   const [msg, setMsg] = useState('');
   const seeded = useRef(false);
@@ -506,7 +510,8 @@ function Rules({ stats, api, run, busy }) {
     if (!seeded.current && stats) {
       seeded.current = true;
       setUrl(stats.upurl || '');
-      setIv(stats.upiv || 24);
+      setHour(stats.uphour ?? 3);
+      setTz(stats.uptz ?? 8);
     }
   }, [stats]);
 
@@ -537,14 +542,17 @@ function Rules({ stats, api, run, busy }) {
           />
         </Field>
         <div className="flex flex-wrap items-end gap-2">
-          <Field label="更新间隔（小时）" className="w-32">
-            <input type="number" min="1" className={INPUT} value={iv} onInput={(e) => setIv(+e.currentTarget.value || 24)} />
+          <Field label="每天何时更新（0-23 时）" className="w-40">
+            <input type="number" min="0" max="23" className={INPUT} value={hour} onInput={(e) => setHour(Math.max(0, Math.min(23, +e.currentTarget.value || 0)))} />
+          </Field>
+          <Field label="时区（UTC+）" className="w-32">
+            <input type="number" min="-12" max="14" className={INPUT} value={tz} onInput={(e) => setTz(Math.max(-12, Math.min(14, +e.currentTarget.value || 0)))} />
           </Field>
           <button
             type="button"
             className={BTN}
             disabled={busy === 'save'}
-            onClick={() => run('save', () => api(`/setupdate?u=${encodeURIComponent(url.trim())}&h=${iv}`, { method: 'POST' }), '已保存')}
+            onClick={() => run('save', () => api(`/setupdate?u=${encodeURIComponent(url.trim())}&h=${hour}&tz=${tz}`, { method: 'POST' }), '已保存')}
           >
             保存
           </button>
