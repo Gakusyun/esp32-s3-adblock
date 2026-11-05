@@ -1248,11 +1248,13 @@ static const char* dohState() {
   return "idle";
 }
 
-// Everything the panel needs, plus the diagnostics that only make sense from a
-// terminal (`curl /stats.json | grep ...`): memory watermarks, PSRAM, flash usage,
-// staging files left over from an interrupted swap, the DoH backoff countdown, the
-// clock (does SNTP actually answer?) and a per-client last-seen age. The panel ignores
-// keys it does not know, so adding one here never touches web/src/app.jsx.
+// Everything the 5-second panel poll needs, plus the diagnostics that only make sense
+// from a terminal (`curl /stats.json | grep ...`): memory watermarks, PSRAM, flash
+// usage, staging files left over from an interrupted swap, the DoH backoff countdown,
+// the clock (does SNTP actually answer?) and a per-client last-seen age. The panel
+// ignores keys it does not know, so adding one here never touches web/src/app.jsx.
+// The two editable tables live in /lists.json instead (see handleLists): inlining them
+// here made every poll carry up to 512 domains + 128 hosts just to display two counts.
 static void handleStats() {
   const uint32_t nowMs = millis();
   const uint32_t up = nowMs / 1000;
@@ -1263,7 +1265,7 @@ static void handleStats() {
   const uint32_t dohBackoffS = (dohFailAt && nowMs - dohFailAt < DOH_BACKOFF_MS)
                                  ? (DOH_BACKOFF_MS - (nowMs - dohFailAt)) / 1000 : 0;
   String j;
-  j.reserve(1536 + (size_t)numClients * 128 + (size_t)numCustom * 28 + (size_t)numHosts * 40);
+  j.reserve(1536 + (size_t)numClients * 128);
   j = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"mac\":\"" + macStr(mac) +
              "\",\"ssid\":\"" + jesc(WiFi.SSID()) + "\",\"gw\":\"" + WiFi.gatewayIP().toString() +
              "\",\"ch\":" + WiFi.channel() +
@@ -1313,7 +1315,16 @@ static void handleStats() {
              ",\"clients\":[";
   for (int i = 0; i < numClients; i++) { Dev& c = clients[i]; IPAddress ip(c.ip);
     j += (i ? "," : ""); j += "{\"ip\":\"" + ip.toString() + "\",\"mac\":\"" + macStr(c.mac) + "\",\"blocked\":" + c.blocked + ",\"allowed\":" + c.allowed + ",\"banned\":" + (c.banned?"true":"false") + ",\"age\":" + (uint32_t)((nowMs - c.lastSeen) / 1000) + "}"; }
-  j += "],\"custom\":[";
+  j += "]}";
+  web.send(200, "application/json", j);
+}
+// The two editable tables: custom block domains and hosts overrides. Fetched once when
+// the panel opens "屏蔽" / "Hosts"; a save re-fetches it so switching tabs back shows
+// what the device actually stored. Same trust level as /stats.json (read-only, no auth).
+static void handleLists() {
+  String j;
+  j.reserve(64 + (size_t)numCustom * 32 + (size_t)numHosts * 48);
+  j = "{\"custom\":[";
   for (int i = 0; i < numCustom; i++) { j += (i ? "," : ""); j += "\"" + jesc(customDom[i]) + "\""; }
   j += "],\"hosts\":[";
   for (int i = 0; i < numHosts; i++) { IPAddress ip(hostEnt[i].ip); j += (i ? "," : "");
@@ -2186,6 +2197,7 @@ void setup() {
   web.on("/", handleRoot);
   web.on("/auth", []() { if (!requireAuth()) return; web.send(200, "text/plain", "ok"); });
   web.on("/stats.json", handleStats);
+  web.on("/lists.json", handleLists);
   web.on("/ban", HTTP_POST, handleBan);
   // Custom block list / hosts overrides are edited as a whole (textarea in the UI):
   // POST the full text, the device re-parses and rewrites the file. A missing "d"

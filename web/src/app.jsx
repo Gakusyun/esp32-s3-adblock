@@ -177,6 +177,8 @@ function Toast({ toast }) {
 /* ── 主应用 ── */
 function App() {
   const [stats, setStats] = useState(null);
+  // 自定义屏蔽 / Hosts 映射整表单独取（/lists.json），不塞进 5 秒轮询的 /stats.json。
+  const [lists, setLists] = useState(null);
   // 支持 ?t=hosts 之类深链，方便直接打开某个标签页
   const [tab, setTab] = useState(() => {
     const t = new URLSearchParams(location.search).get('t');
@@ -216,6 +218,16 @@ function App() {
     }
   }
 
+  async function refreshLists() {
+    try {
+      const r = await fetch('/lists.json', { cache: 'no-store' });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setLists(await r.json());
+    } catch {
+      /* 设备重启/网络抖动时保留旧值，下次打开标签页再取 */
+    }
+  }
+
   async function run(name, fn, okMsg) {
     setBusy(name);
     try {
@@ -237,6 +249,11 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
+  // 只在打开带列表编辑器的标签页时才取整表；取过一次就不再重复（保存后会刷新）。
+  useEffect(() => {
+    if ((tab === 'block' || tab === 'hosts') && !lists) refreshLists();
+  }, [tab, lists]);
+
   // 弹窗打开时锁定页面滚动
   useEffect(() => {
     if (!loginOpen) return;
@@ -249,7 +266,7 @@ function App() {
 
   const total = (stats?.blocked || 0) + (stats?.allowed || 0);
   const ratio = total ? Math.round((stats.blocked / total) * 100) : 0;
-  const ctx = { stats, api, run, busy, say };
+  const ctx = { stats, lists, refreshLists, api, run, busy, say };
 
   return (
     <div className="min-h-screen bg-white dark:bg-black text-slate-800 dark:text-slate-100">
@@ -407,7 +424,7 @@ function Overview({ stats, api, run, busy, ratio, total }) {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Stat label="已拦截" value={fmt(stats.blocked)} sub={total ? `共 ${fmt(total)} 次查询` : '暂无查询'} tone="text-rose-500 dark:text-rose-400" />
           <Stat label="已放行" value={fmt(stats.allowed)} sub="转发上游成功" tone="text-emerald-600 dark:text-emerald-400" />
-          <Stat label="规则条数" value={fmt(stats.domains)} sub={`自定义 ${fmt(stats.custom?.length || 0)} · Hosts ${fmt(stats.hosts?.length || 0)}`} />
+          <Stat label="规则条数" value={fmt(stats.domains)} sub={`自定义 ${fmt(stats.customN ?? 0)} · Hosts ${fmt(stats.hostN ?? 0)}`} />
           <Stat label="缓存命中率" value={cacheRate !== null ? `${cacheRate}%` : '—'}
                 sub={`${fmt(stats.dnsHit)} 命中 · ${fmt(stats.dnsMiss)} 未命中`} tone="text-sky-600 dark:text-sky-400" />
         </div>
@@ -599,8 +616,8 @@ function Rules({ stats, api, run, busy }) {
       <Card title="当前生效">
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           <Stat label="规则条数" value={fmt(stats?.domains)} />
-          <Stat label="自定义屏蔽" value={fmt(stats?.custom?.length || 0)} />
-          <Stat label="Hosts 映射" value={fmt(stats?.hosts?.length || 0)} />
+          <Stat label="自定义屏蔽" value={fmt(stats?.customN ?? 0)} />
+          <Stat label="Hosts 映射" value={fmt(stats?.hostN ?? 0)} />
           <Stat label="更新状态" value={<span className="text-sm font-normal">{stats?.upstat || '—'}</span>} />
         </div>
       </Card>
@@ -635,17 +652,44 @@ const parseLines = (text) =>
     .map((l) => l.split('#')[0].trim())
     .filter(Boolean);
 
-function BlockList({ stats, api, run, busy }) {
+// Mirror of normDomain() / setCustomFromText() in src/main.cpp. The device counts
+// distinct normalized domains across every whitespace-separated token, so a pasted
+// hosts line must not count its "0.0.0.0", and repeats must not count twice.
+const normDomain = (token) => {
+  let s = token.trim().toLowerCase();
+  if (s.startsWith('http://')) s = s.slice(7);
+  if (s.startsWith('https://')) s = s.slice(8);
+  const slash = s.indexOf('/');
+  if (slash >= 0) s = s.slice(0, slash);
+  s = s.replace(/^[*.]+/, '').replace(/\.+$/, '');
+  if (s.startsWith('www.') && s.length > 4) s = s.slice(4);
+  return s.length >= 3 && s.length <= 253 && s.includes('.') && /^[a-z0-9._-]+$/.test(s) ? s : '';
+};
+
+const countCustomDomains = (text) => {
+  const found = new Set();
+  for (const line of text.split('\n')) {
+    // 与固件一致：先按 # 截断，再把 tab 当空格，只按空格切 token（不按 \r 等）。
+    for (const token of line.split('#')[0].replace(/\t/g, ' ').split(' ')) {
+      if (!token || IPV4_RE.test(token) || token === '::' || token === '::1') continue;
+      const d = normDomain(token);
+      if (d) found.add(d);
+    }
+  }
+  return found.size;
+};
+
+function BlockList({ stats, lists, refreshLists, api, run, busy }) {
   const [text, setText] = useState('');
   const seeded = useRef(false);
   useEffect(() => {
-    if (!seeded.current && stats?.custom) {
+    if (!seeded.current && lists?.custom) {
       seeded.current = true;
-      setText((stats.custom || []).join('\n'));
+      setText(lists.custom.join('\n'));
     }
-  }, [stats]);
+  }, [lists]);
 
-  const domains = parseLines(text).map((l) => l.split(/\s+/).pop());
+  const count = countCustomDomains(text);
 
   return (
     <ListEditor
@@ -654,25 +698,26 @@ function BlockList({ stats, api, run, busy }) {
       placeholder={'ads.example.com\ntracker.example.net\n0.0.0.0 stats.example.org'}
       value={text}
       onChange={setText}
-      count={domains.length}
+      count={count}
       busy={busy === 'setblock'}
       onSave={() =>
-        run('setblock', () => api('/setblock', { method: 'POST', body: new URLSearchParams({ d: text }) }), '自定义屏蔽已保存')
+        // 保存后重新取整表：切走再切回来会按设备里真正存下的内容重新初始化。
+        run('setblock', () => api('/setblock', { method: 'POST', body: new URLSearchParams({ d: text }) }), '自定义屏蔽已保存').then(refreshLists)
       }
       footer={<span className="text-xs text-slate-500 dark:text-slate-400">最多 {fmt(stats?.customCap ?? 512)} 条，超出会拒绝保存</span>}
     />
   );
 }
 
-function Hosts({ stats, api, run, busy }) {
+function Hosts({ stats, lists, refreshLists, api, run, busy }) {
   const [text, setText] = useState('');
   const seeded = useRef(false);
   useEffect(() => {
-    if (!seeded.current && stats?.hosts) {
+    if (!seeded.current && lists?.hosts) {
       seeded.current = true;
-      setText((stats.hosts || []).map((h) => `${h.h} ${h.ip}`).join('\n'));
+      setText(lists.hosts.map((h) => `${h.h} ${h.ip}`).join('\n'));
     }
-  }, [stats]);
+  }, [lists]);
 
   const lines = parseLines(text);
   const bad = lines.filter((l) => {
@@ -691,7 +736,7 @@ function Hosts({ stats, api, run, busy }) {
         count={lines.length - bad.length}
         busy={busy === 'sethosts'}
         onSave={() =>
-          run('sethosts', () => api('/sethosts', { method: 'POST', body: new URLSearchParams({ d: text }) }), 'Hosts 映射已保存')
+          run('sethosts', () => api('/sethosts', { method: 'POST', body: new URLSearchParams({ d: text }) }), 'Hosts 映射已保存').then(refreshLists)
         }
         footer={<span className="text-xs text-slate-500 dark:text-slate-400"># 之后为注释</span>}
       />
@@ -798,9 +843,10 @@ function System({ stats, api, run, busy }) {
           {[
             ['IP', stats?.ip],
             ['DNS 上游', stats?.up ? `${stats.up}${DOH_STATE[stats?.dohState] ? ` · ${DOH_STATE[stats.dohState]}` : ''}` : undefined],
-            ['WiFi 信号', stats?.rssi ? `${stats.rssi} dBm` : undefined],
-            ['温度', stats?.temp ? `${stats.temp} °C` : undefined],
-            ['可用内存', stats?.heap ? `${Math.round(stats.heap / 1024)} KB` : undefined],
+            // 0 是合法读数（信号 0 dBm、0 °C、堆耗尽），不能用真值判断把它变成「—」。
+            ['WiFi 信号', stats?.rssi != null ? `${stats.rssi} dBm` : undefined],
+            ['温度', stats?.temp != null ? `${stats.temp} °C` : undefined],
+            ['可用内存', stats?.heap != null ? `${Math.round(stats.heap / 1024)} KB` : undefined],
             ['运行时长', stats?.uptime],
             ['规则条数', fmt(stats?.domains)],
           ].map(([k, v]) => (

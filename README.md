@@ -203,7 +203,7 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 
 两边都是"整表覆盖"语义：文本框里是什么就存什么，删掉一行再保存即取消。
 
-**认证**：`/`、`/stats.json` 只读开放；改状态的接口（`/auth`、`/ban`、`/setblock`、`/sethosts`、
+**认证**：`/`、`/stats.json`、`/lists.json` 只读开放；改状态的接口（`/auth`、`/ban`、`/setblock`、`/sethosts`、
 `/pause`、`/resume`、`/setled`、`/upload`、`/update`、`/setupdate`、`/fetchnow`）需要
 HTTP Basic Auth（`WEB_USER`/`WEB_PASS`）+ 自定义请求头 `X-Requested-With: s3-adblock`（防 CSRF）。
 面板顶部「登录」把凭据存进 `sessionStorage`，之后的请求自动带 `Authorization`。
@@ -271,6 +271,12 @@ curl -i http://<设备IP>/        # 面板
 ```
 
 `/stats.json` 比面板全：面板只取其中几个字段，其余专给命令行排查（加字段不需要改前端）。
+自定义屏蔽与 Hosts 两张**整表**不在 `/stats.json` 里（每 5 秒轮询不该带最多 512+128 行），
+面板打开「屏蔽」/「Hosts」标签页时才去取 `/lists.json`：
+
+```bash
+curl -s http://<设备IP>/lists.json    # {"custom":[...],"hosts":[{"h":"...","ip":"..."}]}
+```
 
 | 字段 | 含义 |
 |---|---|
@@ -325,7 +331,8 @@ curl -s http://<设备IP>/stats.json | grep -o '"dnsH[^,]*,"dnsM[^,]*'   # 命�
 
 - 只支持 Wi-Fi 2.4GHz（芯片限制），不支持 5GHz。
 - 面板/OTA 都是明文 HTTP；局域网信任边界内的防护，不是加密方案。
-- `/stats.json` 不鉴权（内网只读），里面有每个客户端的 IP/MAC、自定义屏蔽与 Hosts 表。
+- `/stats.json` 与 `/lists.json` 不鉴权（内网只读），里面有每个客户端的 IP/MAC
+  以及自定义屏蔽与 Hosts 表。
 - 默认上游是**明文 UDP DNS**（可被链路上的中间人改写/投毒），想防就开 DoH（见上）。
   规则拉取用 CA 校验，但**没有 NTP 时会降级不校验**；规则 URL 写成 `http://` 时
   同样没有证书校验，两者都会让 `fetchInsecure` 为 true。
