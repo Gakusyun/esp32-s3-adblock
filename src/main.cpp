@@ -1,6 +1,6 @@
-// C3 AdBlock — DNS sinkhole + web dashboard for the ESP32-C3 (no PSRAM).
+// S3 AdBlock — DNS sinkhole + web dashboard for the ESP32-S3 (N16R8).
 // Blocklist = sorted 40-bit FNV-1a hashes in flash, binary-searched.
-// Dashboard at http://c3adblock.local : per-client stats, system info,
+// Dashboard at http://s3adblock.local : per-client stats, system info,
 // ban clients, add custom block domains. All control state persisted to flash.
 
 #include <Arduino.h>
@@ -15,17 +15,30 @@
 #include <ArduinoOTA.h>        // network firmware flashing (pio run over wifi)
 #include <DNSServer.h>         // captive-portal catch-all DNS
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
+#include "esp_heap_caps.h"     // PSRAM-backed arena for the on-device rules parser
 #include "lwip/etharp.h"
 #include "lwip/netif.h"
 #include "secrets.h"   // WIFI_SSID / WIFI_PASS — used only as a FALLBACK if no creds
                        // have been provisioned via the captive portal (copy secrets.example.h)
 
 // ---- config ----
+// AliDNS — low latency from mainland China. Override in secrets.h if needed.
 #ifndef UPSTREAM_IP
-#define UPSTREAM_IP 9, 9, 9, 9                    // Quad9
+#define UPSTREAM_IP 223, 5, 5, 5
 #endif
 #ifndef UPSTREAM_PORT
 #define UPSTREAM_PORT 53
+#endif
+
+// Default rules source (used when /update.cfg doesn't exist yet).
+#ifndef RULE_URL
+#define RULE_URL "https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-hosts.txt"
+#endif
+#ifndef RULE_URL_FALLBACK
+#define RULE_URL_FALLBACK "https://gcore.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-hosts.txt"
+#endif
+#ifndef RULE_INTERVAL_H
+#define RULE_INTERVAL_H 24
 #endif
 static const IPAddress UPSTREAM(UPSTREAM_IP);
 static const uint16_t DNS_PORT = 53;
@@ -342,14 +355,14 @@ static void handleStats() {
 // and browsers auto-attach cached Basic Auth credentials to *any* request to an
 // already-authenticated origin — including one triggered by a completely
 // unrelated page the victim's browser visits later (e.g. <img src="http://
-// c3adblock.local/forgetwifi">). That's CSRF, and it defeats the LAN-attacker
+// s3adblock.local/forgetwifi">). That's CSRF, and it defeats the LAN-attacker
 // threat model entirely: the attacker doesn't need network access, just to get
 // the victim's browser to fire one request. A custom header can't be attached
 // by a plain <img>/<form> CSRF vector (only same-origin fetch() can set it, and
 // that's exactly what the dashboard's own JS does), so requiring one blocks the
 // drive-by case without needing TLS, cookies, or a token endpoint.
 static const char* CSRF_HEADER = "X-Requested-With";
-static const char* CSRF_VALUE  = "c3-adblock";
+static const char* CSRF_VALUE  = "s3-adblock";
 static bool requireAuth() {
   if (web.header(CSRF_HEADER) != CSRF_VALUE) { web.send(403, "text/plain", "missing CSRF header"); return false; }
   if (web.authenticate(WEB_USER, WEB_PASS)) return true;
@@ -425,18 +438,20 @@ static void handleUpload() {
 
 // ---------- remote blocklist auto-update ----------
 static void loadUpdateCfg() {
+  updateUrl = RULE_URL; updateIntervalH = RULE_INTERVAL_H;   // compiled-in defaults
   File f = LittleFS.open("/update.cfg", "r"); if (!f) return;
   updateUrl = f.readStringUntil('\n'); updateUrl.trim();
   String iv = f.readStringUntil('\n'); iv.trim(); if (iv.length()) updateIntervalH = iv.toInt();
   f.close(); if (updateIntervalH < 1) updateIntervalH = 1;
+  if (!updateUrl.length()) updateUrl = RULE_URL;
 }
 static void saveUpdateCfg() {
   File f = LittleFS.open("/update.cfg", "w"); if (!f) return;
   f.println(updateUrl); f.println(updateIntervalH); f.close();
 }
-static bool fetchBlocklist(String url) {
-  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
-  Serial.printf("[remote] GET %s\n", url.c_str());
+// A prebuilt hash blob: streamed straight into LittleFS (legacy path, *.bin URLs).
+static bool fetchBin(const String& url) {
+  Serial.printf("[remote] GET bin %s\n", url.c_str());
   WiFiClientSecure cs; cs.setInsecure();            // blocklist isn't secret -> skip cert pinning
   WiFiClient cl;
   HTTPClient http; http.setTimeout(20000);
@@ -457,7 +472,162 @@ static bool fetchBlocklist(String url) {
   }
   f.close(); http.end();
   bool ok = commitNewBlocklist();
-  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : ("bad data (" + String(total) + "B)");
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains (bin)") : ("bad data (" + String(total) + "B)");
+  Serial.printf("[remote] %s\n", updateStatus.c_str());
+  return ok;
+}
+
+// ---------- text rule lists, parsed on the device ----------
+// The ESP32-S3 has room to hash a plain-text list itself, so scheduled updates can
+// point straight at a rules file (AWAvenue, hosts files, plain domain lists,
+// AdGuard basic rules) instead of a prebuilt .bin that someone has to host.
+// Domains are hashed into a PSRAM arena, sorted, deduped and written to
+// /blocklist.new, then swapped in through the same validation as an upload.
+static uint64_t* ruleHashes = nullptr;
+static size_t    ruleCount = 0, ruleCap = 0;
+static uint32_t  ruleSkipped = 0;
+
+static bool ruleReserve() {
+  if (ruleCount + 1 <= ruleCap) return true;
+  size_t cap = ruleCap ? ruleCap * 2 : 4096;
+  if (cap > 4000000) return false;                        // hard cap: 32MB of hashes
+  uint64_t* p = (uint64_t*)heap_caps_realloc(ruleHashes, cap * sizeof(uint64_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = (uint64_t*)realloc(ruleHashes, cap * sizeof(uint64_t));
+  if (!p) return false;
+  ruleHashes = p; ruleCap = cap; return true;
+}
+
+// Lowercase/normalise a domain exactly like tools/build_blocklist.py's norm():
+// strip leading wildcards + dots, trailing dots, a leading "www.".
+static void addRuleDomain(const char* raw) {
+  char d[260];
+  size_t n = strlen(raw);
+  if (n == 0 || n >= sizeof(d)) return;
+  memcpy(d, raw, n + 1);
+  char* s = d; while (*s == '*' || *s == '.') s++;
+  size_t m = strlen(s); while (m && s[m - 1] == '.') s[--m] = 0;
+  if (m > 4 && strncmp(s, "www.", 4) == 0) { s += 4; m -= 4; }
+  if (m < 3 || m > 253 || !strchr(s, '.')) return;
+  for (size_t i = 0; i < m; i++) {
+    char c = s[i];
+    if (c >= 'A' && c <= 'Z') s[i] = c + 32;
+    else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return;
+  }
+  if (strcmp(s, "localhost") == 0) return;
+  if (!ruleReserve()) return;
+  ruleHashes[ruleCount++] = fnv40(s, m);
+}
+
+static void parseRuleLine(char* line) {
+  char* hash = strchr(line, '#'); if (hash) *hash = 0;   // comments (AdGuard cosmetics too)
+  char* s = line; while (*s == ' ' || *s == '\t') s++;
+  size_t L = strlen(s); while (L && (s[L - 1] == ' ' || s[L - 1] == '\t' || s[L - 1] == '\r')) s[--L] = 0;
+  if (!L) return;
+  if (*s == '!' || *s == '[' || *s == '/' || *s == '@') { if (*s == '@') ruleSkipped++; return; }
+  if (s[0] == '|' && s[1] == '|') {                      // AdGuard / ABP: ||domain^
+    char* t = s + 2; char* e = t;
+    while (*e && *e != '^' && *e != '$' && *e != '/' && *e != '|') e++;
+    if (*e == '$' || *e == '|') { ruleSkipped++; return; }   // $modifiers / regex can't be hashed
+    *e = 0; addRuleDomain(t); return;
+  }
+  if (strchr(s, '^') || strchr(s, '$') || strchr(s, '*') || strchr(s, '|')) { ruleSkipped++; return; }
+  char* sp = s; while (*sp && *sp != ' ' && *sp != '\t') sp++;
+  if (*sp) {                                            // hosts line: "0.0.0.0 a b c"
+    *sp = 0;
+    const bool isIp = !strcmp(s, "0.0.0.0") || !strcmp(s, "127.0.0.1") || !strcmp(s, "::") || !strcmp(s, "::1");
+    if (!isIp) return;                                  // "domain   comment" -> ignore
+    char* p = sp + 1;
+    while (*p) {
+      while (*p == ' ' || *p == '\t') p++;
+      if (!*p) break;
+      char* e = p; while (*e && *e != ' ' && *e != '\t') e++;
+      char save = *e; *e = 0; addRuleDomain(p); *e = save;
+      if (!*e) break;
+      p = e + 1;
+    }
+    return;
+  }
+  addRuleDomain(s);                                     // plain domain list
+}
+
+static int cmpU64Asc(const void* a, const void* b) {
+  uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+  return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static bool commitRuleHashes(size_t bytesRead) {
+  if (ruleCount == 0) { updateStatus = "no rules parsed (" + String(bytesRead) + "B)"; return false; }
+  qsort(ruleHashes, ruleCount, sizeof(uint64_t), cmpU64Asc);
+  beginBlocklistSwap();
+  File f = LittleFS.open("/blocklist.new", "w");
+  if (!f) { updateStatus = "fs open failed"; reopenBlocklist(); return false; }
+  uint8_t b[HASH_BYTES]; size_t uniq = 0;
+  for (size_t i = 0; i < ruleCount; i++) {
+    if (i && ruleHashes[i] == ruleHashes[i - 1]) continue;
+    packHash(ruleHashes[i], b);
+    if (f.write(b, HASH_BYTES) != HASH_BYTES) { f.close(); updateStatus = "write failed"; reopenBlocklist(); return false; }
+    uniq++;
+  }
+  f.close();
+  bool ok = commitNewBlocklist();
+  Serial.printf("[remote] parsed %u domains (%u skipped) -> %u unique\n",
+                (unsigned)ruleCount, (unsigned)ruleSkipped, (unsigned)uniq);
+  updateStatus = ok ? ("ok: " + String(numHashes) + " domains") : "bad data";
+  return ok;
+}
+
+static bool fetchRuleText(const String& url) {
+  Serial.printf("[remote] GET rules %s\n", url.c_str());
+  WiFiClientSecure cs; cs.setInsecure();
+  WiFiClient cl;
+  HTTPClient http; http.setTimeout(25000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  bool https = url.startsWith("https");
+  if (!(https ? http.begin(cs, url) : http.begin(cl, url))) { updateStatus = "begin failed"; return false; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) { http.end(); updateStatus = "HTTP " + String(code); Serial.printf("[remote] %s\n", updateStatus.c_str()); return false; }
+
+  ruleCount = 0; ruleSkipped = 0;
+  WiFiClient* stream = http.getStreamPtr();
+  int len = http.getSize();
+  char line[320]; size_t ll = 0; bool ovf = false;
+  uint8_t b[512]; size_t total = 0; uint32_t idle = millis();
+  while (http.connected() && (len < 0 || (int)total < len)) {
+    size_t avail = stream->available();
+    if (!avail) { if (millis() - idle > 15000) break; delay(2); continue; }
+    int n = stream->readBytes(b, avail > sizeof(b) ? sizeof(b) : avail);
+    if (n <= 0) continue;
+    idle = millis(); total += n;
+    for (int i = 0; i < n; i++) {
+      char c = (char)b[i];
+      if (c == '\n') {
+        if (ovf) { ovf = false; ll = 0; }                 // over-long line (cosmetic junk) -> drop
+        else { line[ll] = 0; parseRuleLine(line); ll = 0; }
+      } else if (c != '\r') {
+        if (ll < sizeof(line) - 1) line[ll++] = c; else ovf = true;
+      }
+    }
+  }
+  http.end();
+  if (ll && !ovf) { line[ll] = 0; parseRuleLine(line); }
+  return commitRuleHashes(total);
+}
+
+static bool fetchRules(const String& url) {
+  if (fetchRuleText(url)) return true;
+  const String first = updateStatus;
+  if (url == RULE_URL && String(RULE_URL_FALLBACK) != url) {   // mirror only for the built-in URL
+    Serial.printf("[remote] primary failed (%s) -> fallback\n", first.c_str());
+    if (fetchRuleText(RULE_URL_FALLBACK)) return true;
+  }
+  updateStatus = first;
+  return false;
+}
+
+static bool fetchBlocklist(String url) {
+  url.trim(); if (!url.length()) { updateStatus = "no url set"; return false; }
+  bool ok = url.endsWith(".bin") ? fetchBin(url) : fetchRules(url);
+  free(ruleHashes); ruleHashes = nullptr; ruleCap = 0; ruleCount = 0;   // release the PSRAM arena
   Serial.printf("[remote] %s\n", updateStatus.c_str());
   return ok;
 }
@@ -498,6 +668,15 @@ static bool hasCreds() {
   prefs.begin("wifi", true); bool nvs = prefs.getString("ssid", "").length() > 0; prefs.end();
   return nvs || (WIFI_SSID && *WIFI_SSID && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0);
 }
+// Precise failure reason (ESP-IDF wifi_err_reason_t) instead of a bare WL_CONNECT_FAILED:
+// 15/204 = 4-way handshake timeout (wrong password), 202 = auth fail, 2 = auth expire
+// (often MAC filtering), 201 = AP not found, 205 = connection failed.
+static void onWifiEvent(WiFiEvent_t ev, WiFiEventInfo_t info) {
+  if (ev == ARDUINO_EVENT_WIFI_STA_CONNECTED) Serial.println("[wifi] associated, authenticating...");
+  else if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+    Serial.printf("[wifi] disconnected: reason=%d\n", (int)info.wifi_sta_disconnected.reason);
+}
+
 static bool connectWiFi() {
   prefs.begin("wifi", true);
   String ss = prefs.getString("ssid", "");
@@ -507,19 +686,27 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(ssid, pass);
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.onEvent(onWifiEvent); WiFi.begin(ssid, pass);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
   Serial.println();
+  if (WiFi.status() != WL_CONNECTED) {                 // diagnostics: why did the join fail?
+    Serial.printf("[wifi] failed, status=%d (1=no ssid, 4=connect failed, 6=disconnected)\n", (int)WiFi.status());
+    WiFi.disconnect(true); delay(200);
+    int n = WiFi.scanNetworks();
+    Serial.printf("[wifi] scan: %d networks\n", n);
+    for (int i = 0; i < n && i < 12; i++)
+      Serial.printf("[wifi]   %s  rssi=%d enc=%d\n", WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i), (int)WiFi.encryptionType(i));
+  }
   return WiFi.status() == WL_CONNECTED;
 }
 
 static void handlePortalRoot() {
   String html =
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>C3 AdBlock setup</title>"
+    "<title>S3 AdBlock setup</title>"
     "<body style='font:16px system-ui,sans-serif;max-width:420px;margin:36px auto;padding:0 16px;background:#0d1117;color:#c9d1d9'>"
-    "<h2>&#128737; C3 AdBlock &mdash; WiFi setup</h2>"
+    "<h2>&#128737; S3 AdBlock &mdash; WiFi setup</h2>"
     "<p style='color:#8b949e'>Pick your network and enter its password. The device restarts and joins it.</p>"
     "<form method=POST action=/wifisave>"
     "<input list=nets name=s placeholder='WiFi name' required style='width:100%;box-sizing:border-box;padding:11px;margin:6px 0;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#c9d1d9'>"
@@ -535,7 +722,7 @@ static void handleWifiSave() {
   prefs.begin("wifi", false); prefs.putString("ssid", ss); prefs.putString("pass", pw); prefs.end();
   web.send(200, "text/html", "<!doctype html><meta charset=utf-8><body style='font:16px system-ui;text-align:center;margin-top:60px'>"
                              "&#9989; Saved. Restarting and joining <b>" + htmlEscape(ss) + "</b>&hellip;<br><br>"
-                             "Reconnect your phone to your normal WiFi, then find the box at <b>c3adblock.local</b>.</body>");
+                             "Reconnect your phone to your normal WiFi, then find the box at <b>s3adblock.local</b>.</body>");
   delay(900); ESP.restart();
 }
 // Never returns — blocks in the portal loop until creds are saved (then reboots).
@@ -544,7 +731,7 @@ static void startConfigPortal() {
   portalOpts = "";
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
-  char ap[24]; snprintf(ap, sizeof(ap), "C3-AdBlock-%02X%02X", mac[4], mac[5]);
+  char ap[24]; snprintf(ap, sizeof(ap), "S3-AdBlock-%02X%02X", mac[4], mac[5]);
   WiFi.mode(WIFI_AP); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
@@ -567,7 +754,7 @@ static void startConfigPortal() {
 
 void setup() {
   Serial.begin(115200); delay(300);
-  Serial.println("\n[c3-adblock] booting");
+  Serial.println("\n[s3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
   if (blocklist) {
@@ -582,7 +769,7 @@ void setup() {
 #if CONFIG_IDF_TARGET_ESP32C3
   const int BOOT_PIN = 9;     // C3 BOOT button
 #else
-  const int BOOT_PIN = 0;     // classic ESP32 BOOT button (GPIO9 is a flash pin there)
+  const int BOOT_PIN = 0;     // ESP32-S3 / classic ESP32 BOOT button
 #endif
   pinMode(BOOT_PIN, INPUT_PULLUP);
   if (digitalRead(BOOT_PIN) == LOW) { delay(60);
@@ -591,7 +778,7 @@ void setup() {
 
   if (!connectWiFi()) startConfigPortal();   // portal blocks + reboots on save; returns only when connected
   Serial.printf("WiFi up: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("c3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://c3adblock.local"); }
+  if (MDNS.begin("s3adblock")) { MDNS.addService("http", "tcp", 80); Serial.println("dashboard: http://s3adblock.local"); }
 
   if (strcmp(WEB_PASS, "CHANGE_ME_WEB_PASSWORD") == 0 || strcmp(OTA_PASS, "CHANGE_ME_OTA_PASSWORD") == 0)
     Serial.println("[WARN] secrets.h still has placeholder WEB_PASS/OTA_PASS — those are public "
@@ -624,7 +811,7 @@ void setup() {
     saveUpdateCfg(); web.send(200, "text/plain", "ok");
   });
   web.begin();
-  ArduinoOTA.setHostname("c3adblock");   // pio run -t upload --upload-port c3adblock.local
+  ArduinoOTA.setHostname("s3adblock");   // pio run -t upload --upload-port s3adblock.local
   ArduinoOTA.setPassword(OTA_PASS);      // network OTA was unauthenticated upstream
   ArduinoOTA.begin();
   Serial.println("DNS :53 + dashboard :80 + OTA up");
@@ -635,9 +822,12 @@ void loop() {
   web.handleClient();
   bool busy = handleDns();
   if (!blockingOn && resumeAt && (int32_t)(millis() - resumeAt) >= 0) { blockingOn = true; resumeAt = 0; }
-  if (updateUrl.length()) {               // periodic remote blocklist auto-update
+  if (updateUrl.length()) {               // periodic remote rule auto-update
     uint32_t now = millis();
-    if (lastCheckMs == 0) lastCheckMs = now;   // skip an immediate fetch on boot
+    if (lastCheckMs == 0) {
+      lastCheckMs = now;                   // don't hammer the CDN on every boot
+      if (numHashes == 0) fetchBlocklist(updateUrl);   // nothing baked in -> pull now
+    }
     else if (now - lastCheckMs >= updateIntervalH * 3600000UL) { lastCheckMs = now; fetchBlocklist(updateUrl); }
   }
   if (!busy) delay(1);   // sleep only when idle: full speed under load, cool when quiet

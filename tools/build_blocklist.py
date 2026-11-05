@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """Preprocess hosts/domain blocklists into a sorted truncated-FNV-1a hash blob
-for the ESP32-C3 ad-blocker. Hashes live in flash and are binary-searched on the
+for the ESP32-S3 ad-blocker. Hashes live in flash and are binary-searched on the
 device, so no PSRAM is needed.
 
 HASH_BYTES MUST match the firmware (src/main.cpp). 5 bytes (40-bit) keeps
 ~0 collisions up to ~500k domains while fitting half a million in <3 MB.
 
 Usage: build_blocklist.py [out.bin] [src ...]
-  src = local file or URL. With none given, downloads a balanced daily-driver set
-  (StevenBlack base + Hagezi Light) ~= 100k entries: blocks ads/trackers/malware
-  but leaves WhatsApp/Instagram/social/messaging working.
-
-  For the aggressive "test the limits" build (~500k, also blocks social/messaging):
-    build_blocklist.py blocklist.bin \\
-      https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn-social/hosts \\
-      https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/ultimate-onlydomains.txt
+  src = local file or URL. With none given, downloads the default list:
+  AWAvenue Ads Rule (full hosts list) -- a curated, mainland-China-oriented
+  ad/tracker list.  The device can also fetch + hash the text itself; this
+  script is for baking a copy into LittleFS at flash time.
 """
 import re
 import sys, os, math, urllib.request
@@ -25,14 +21,12 @@ FNV_OFFSET = 0xcbf29ce484222325
 FNV_PRIME  = 0x100000001b3
 U64 = (1 << 64) - 1
 
-# Daily driver that FITS alongside dual-OTA firmware slots (~250k domain budget):
-# ads + trackers + malware, WhatsApp/social keep working. ~100k entries / 0.5 MB
-# (Hagezi's wildcard lists drop subdomains the firmware's parent-matching already covers).
-# Want more? swap light-onlydomains.txt -> pro-onlydomains.txt is 370k and ONLY fits the
-# single-app (no-OTA) partition table.
+# Default: AWAvenue Ads Rule, full hosts list (~1.9k domains). The primary CDN
+# (jsDelivr) is reachable from mainland China; its gcore edge is the fallback.
+# raw.githubusercontent.com is frequently unreachable there, hence the mirror.
 DEFAULT_SOURCES = [
-    'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',            # base: ads + malware
-    'https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt',  # Hagezi Light (wildcard = domain + subdomains)
+    ('https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-hosts.txt',
+     'https://gcore.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-Ads-Rule-hosts.txt'),
 ]
 
 # ||domain^  or  @@||domain^  optionally followed by $modifiers
@@ -61,19 +55,27 @@ def main():
     args = [a for a in sys.argv[1:] if a != '--allow-missing']
     ALLOW_MISSING = '--allow-missing' in sys.argv[1:]
     out = args[0] if args else 'blocklist.bin'
-    sources = args[1:] if len(args) > 1 else DEFAULT_SOURCES
+    sources = [s if isinstance(s, tuple) else (s, None) for s in (args[1:] if len(args) > 1 else DEFAULT_SOURCES)]
 
     domains, allow = set(), set()
     skipped = 0
-    for src in sources:
+    for src, fallback in sources:
+        data = None
         try:
             data = read_source(src)
         except Exception as e:
-            # Fail loudly: silently dropping a source shrinks the list without anyone noticing
-            # (happened when Hagezi retired domains/light.txt). Pass --allow-missing to continue.
-            print(f'  !! FAILED to read {src}: {e}', file=sys.stderr)
-            if not ALLOW_MISSING: sys.exit(1)
-            continue
+            if fallback:
+                print(f'  !! FAILED {src}: {e} -- trying fallback {fallback}', file=sys.stderr)
+                try:
+                    data = read_source(fallback)
+                except Exception as e2:
+                    e = e2
+            if data is None:
+                # Fail loudly: silently dropping a source shrinks the list without
+                # anyone noticing. Pass --allow-missing to continue anyway.
+                print(f'  !! FAILED to read {src}: {e}', file=sys.stderr)
+                if not ALLOW_MISSING: sys.exit(1)
+                continue
         for line in data.splitlines():
             line = line.split('#', 1)[0].strip() if not line.lstrip().startswith(('||', '@@')) else line.strip()
             if not line or line[0] in '!/[':
