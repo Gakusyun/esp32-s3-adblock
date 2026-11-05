@@ -12,11 +12,12 @@
 # Generated blocklist (build it with tools/build_blocklist.py)
 data/blocklist.bin
 
-# Dashboard build inputs/outputs. data/index.html.gz is a build artifact:
+# Dashboard build inputs/outputs. data/index.html(.gz) are build artifacts:
 # run `cd web && npm run build` before `pio run -t uploadfs`.
 web/node_modules/
 web/dist/
 data/index.html.gz
+data/index.html
 
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h

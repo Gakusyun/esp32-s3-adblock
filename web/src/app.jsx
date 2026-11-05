@@ -8,8 +8,6 @@ const BTN =
   'px-3 py-1.5 rounded-lg bg-sky-600 text-white text-sm font-medium hover:bg-sky-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors';
 const BTN_OUTLINE =
   'px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-600 text-sm text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed transition-colors';
-const BTN_DANGER =
-  'px-3 py-1.5 rounded-lg border border-rose-300 dark:border-rose-800 text-sm text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed transition-colors';
 const SMALL_BTN =
   'text-xs px-2 py-1 rounded-md border border-slate-300 dark:border-slate-600 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-900 transition-colors';
 
@@ -17,6 +15,13 @@ const CSRF = { 'X-Requested-With': 's3-adblock' };
 const POLL_MS = 5000;
 
 const fmt = (n) => (n === undefined || n === null ? '—' : Number(n).toLocaleString('zh-CN'));
+
+// The device owns every limit and default (MAX_CUSTOM / MAX_HOSTS in src/main.cpp) and
+// publishes them in /stats.json, so the UI never hardcodes a number that can drift.
+// An IPv4 check that accepts 999.1.1.1 is worse than none: the device silently drops
+// such a line and the user is told it was saved.
+const OCTET = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
+const IPV4_RE = new RegExp(`^${OCTET}(\\.${OCTET}){3}$`);
 
 const TABS = [
   { id: 'overview', label: '概览' },
@@ -423,7 +428,7 @@ function Overview({ stats, api, run, busy, ratio, total }) {
       >
         <p className="break-all font-mono text-xs text-slate-500 dark:text-slate-400">{stats.upurl || '未设置'}</p>
         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
-          <span>每天 {String(stats.uphour ?? 3).padStart(2, '0')}:00 自动更新（UTC+{stats.uptz ?? 8}）</span>
+          <span>每天 {String(stats.uphour).padStart(2, '0')}:00 自动更新（UTC+{stats.uptz}）</span>
           <span>上次：{stats.upstat || '从未'}</span>
         </div>
       </Card>
@@ -654,7 +659,7 @@ function BlockList({ stats, api, run, busy }) {
       onSave={() =>
         run('setblock', () => api('/setblock', { method: 'POST', body: new URLSearchParams({ d: text }) }), '自定义屏蔽已保存')
       }
-      footer={<span className="text-xs text-slate-500 dark:text-slate-400">最多 512 条，其余忽略</span>}
+      footer={<span className="text-xs text-slate-500 dark:text-slate-400">最多 {fmt(stats?.customCap ?? 512)} 条，超出会拒绝保存</span>}
     />
   );
 }
@@ -672,14 +677,14 @@ function Hosts({ stats, api, run, busy }) {
   const lines = parseLines(text);
   const bad = lines.filter((l) => {
     const p = l.split(/\s+/);
-    return p.length < 2 || !/^\d{1,3}(\.\d{1,3}){3}$/.test(p[1]);
+    return p.length < 2 || !IPV4_RE.test(p[1]);
   });
 
   return (
     <>
       <ListEditor
         title="Hosts 映射"
-        hint="一行一条「域名 空格 目标IP」，设备直接按你写的 IP 应答（相当于内置 /etc/hosts）。只做 IPv4；AAAA 查询返回空，客户端会走 IPv4。最多 128 条。"
+        hint={`一行一条「域名 空格 目标IP」，设备直接按你写的 IP 应答（相当于内置 /etc/hosts）。只做 IPv4；AAAA 查询返回空，客户端会走 IPv4。最多 ${fmt(stats?.hostCap ?? 128)} 条。`}
         placeholder={'nas.home 192.168.4.100\nrouter.lan 192.168.4.250\nprinter.lan 192.168.4.120'}
         value={text}
         onChange={setText}

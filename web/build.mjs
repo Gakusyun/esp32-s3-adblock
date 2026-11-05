@@ -61,6 +61,9 @@ async function buildOnce() {
   writeFileSync(resolve(dist, 'index.html'), html);
   const gz = gzipSync(Buffer.from(html, 'utf8'), { level: 9 });
   writeFileSync(outFile, gz);
+  // The plain copy as well: the firmware serves it to clients that did not send
+  // "Accept-Encoding: gzip" (50 KB of an 11.75 MB partition).
+  writeFileSync(resolve(here, '../data/index.html'), html);
 
   const kb = (n) => (n / 1024).toFixed(1) + ' KB';
   console.log(`html   ${kb(Buffer.byteLength(html))}  (css ${kb(styles.length)}, js ${kb(js.length)})`);

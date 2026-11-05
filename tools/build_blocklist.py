@@ -116,7 +116,12 @@ def main():
     print(f'hash entries     : {n:,}  ({HASH_BYTES}-byte / {HASH_BYTES*8}-bit)')
     print(f'collisions       : {collisions}  (domains sharing a hash -> over-block)')
     print(f'flash blob       : {size:,} bytes  ({size/1024/1024:.2f} MB)  -> {out}')
-    print(f'lookup           : ~{math.ceil(math.log2(max(n,2)))} reads/query')
+    # 固件不是纯二分：维护一张“每 ~8 条抽一个”的一级索引（默认 4096 个桶封顶），
+    # 先在索引里二分挑桶，再把整个桶读进 RAM 线性扫。所以一次查询 = 1 次索引读 +
+    # 1~2 次桶读，与表大小几乎无关。
+    buckets = min(max(n // 8, 2), 4096)
+    print(f'index buckets    : {buckets:,}  (~{math.ceil(n / buckets)} hashes per bucket)')
+    print(f'lookup           : 1 index read + 1 bucket read/query')
 
 if __name__ == '__main__':
     main()

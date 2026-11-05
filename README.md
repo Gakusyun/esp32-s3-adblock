@@ -1,7 +1,7 @@
 # ESP32-S3 广告拦截器（DNS 黑洞 + 网页面板）
 
 一个跑在 **ESP32-S3 (16MB Flash + 8MB PSRAM)** 上的 Pi-hole 式 DNS 广告拦截器：
-拦截表以**排序后的 40 位哈希**存在 Flash 里，查询时二分查找，RAM 占用约 50KB，
+拦截表以**排序后的 40 位哈希**存在 Flash 里，查询时二分查找，RAM 占用约 10KB，
 **不需要把域名列表读进内存**。
 
 > **上游项目**：本项目 fork 自
@@ -11,7 +11,7 @@
 > **本 fork 的改动**
 > - 目标板改为 **ESP32-S3（N16R8：16MB Flash + 8MB Octal PSRAM）**，串口走板载 CH343
 >   （`/dev/ttyACM0`，UART0），不启用原生 USB-CDC；
-> - 分区表改为 16MB 双 OTA：两个 2MB app 槽 + 11.75MB LittleFS（固件和规则都能网页 OTA）；
+> - 分区表改为 16MB 双 OTA：两个 2MB app 槽 + 11.94MiB LittleFS（固件和规则都能网页 OTA）；
 > - 上游 DNS 由 Quad9 换成 **阿里 DNS `223.5.5.5`**（国内延迟低）；
 > - 拦截规则换成 **[AWAvenue-Ads-Rule](https://github.com/TG-Twilight/AWAvenue-Ads-Rule) 完整版**；
 > - 新增**设备端解析文本规则**：直接填 AWAvenue 的 rules 文本 URL，设备自己解析 → 哈希 → 写 Flash，
@@ -32,7 +32,7 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
 ```
 
 - 每条规则占 **5 字节（40bit）**，AWAvenue 完整版约 1000 条 ≈ **5KB**；
-  就算 50 万条也只占 2.5MB Flash，Flash 有 11.75MB 可用。
+  就算 50 万条也只占 2.5MB Flash，Flash 有 11.94MiB 可用。
 - 40bit 在 50 万条量级下碰撞约 0~1 个（最坏情况是多误杀一个域名）。
 - 被拦截域名自动连带拦截其子域名（查询时逐级哈希父域名）。
 
@@ -53,17 +53,15 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
   不缓存：上游抖一下就缓存住几分钟，比重新问一次更痛苦。
 - **内存按条精确分配**：每条自己 `heap_caps_malloc` 恰好 `应答长度 + 键长度` 字节
   （典型 **~110B**，不是每槽固定预 512B），已用字节实时记账，**不会溢出**。
-  唯一的硬上限是**表项数 1024**（`DNS_CACHE_SLOTS`，静态数组约 28KB 内部 RAM）：
+  唯一的硬上限是**表项数 1024**（`DNS_CACHE_SLOTS`）：
   单条最大 `512 + 288` 字节，所以 1024 条最多占 ~800KB，典型只有 ~110KB。
-  想让缓存更大就调 `DNS_CACHE_SLOTS`（每条槽位约 28B 内部 RAM），用 `/stats.json` 的
-  `dnsCacheN` / `dnsCacheBytes` 观察。
-  > 早先这里还有一个“按空闲 PSRAM 算出来的 4MB byte 预算”。它永远比表项数先到不了，
-  > 属于假装是上限，已经删掉。
-- **缺空间时的淘汰策略**（类似页面置换）：
-  1. 已过期的先丢；
-  2. 否则丢“**TTL 最接近过期**”的；
-  3. 一样的再比**命中次数最少**的；
-  4. 再一样就丢**最久没被用过**的（LRU）。
+  槽位表本身（1024 × 34B ≈ 34KB）在**开机时从 PSRAM 分配**，不再占内部 RAM；
+  想让缓存更大就调 `DNS_CACHE_SLOTS`，用 `/stats.json` 的 `dnsCacheN` / `dnsCacheBytes` 观察。
+- **查找 / 淘汰都是 O(1)**：256 个桶的链式哈希 + 侵入式 LRU 链表。
+  > 早先这里是“线性扫 1024 槽找命中”，淘汰还要再扫两遍挑“TTL 最接近过期”的，
+  > 表满时每次未命中要遍历约 4000 个槽；现在只剩链上几个槽的比对，淘汰固定丢 LRU 尾部
+  > （过期条目本来就会沉到尾部）。
+- 过期的条目在**被再次查到时就地释放**（早先它只是返回 miss，却继续占着槽、每次还要重新解析一遍）。
   被拦截/被 Hosts 映射的查询不经过缓存，只有真正转发的才会占位。
 - 规则表更新（远程拉取 / 网页上传）时清空一次缓存，避免新规则与旧答案不一致。
 - 面板「概览 → 统计」只显示**缓存命中率**（命中 / 未命中次数）；条目数、占用字节、淘汰次数
@@ -168,14 +166,16 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 | otadata | 0xe000 | 8KB |
 | app0 (ota_0) | 0x10000 | 2MB |
 | app1 (ota_1) | 0x210000 | 2MB |
-| littlefs | 0x410000 | 11.75MB |
+| littlefs | 0x410000 | 11.94MiB |
 
 想放弃固件 OTA、把空间全给规则表，改 `partitions.csv` 即可。
 
 ## 网页面板
 
-面板是独立的 **Preact + Tailwind CSS** 前端（`web/`），构建后是**一个 18KB 的 gzip HTML**，
+面板是独立的 **Preact + Tailwind CSS** 前端（`web/`），构建后是**一个 18KB 的 gzip HTML**（另存一份 60KB 未压缩版 `data/index.html`），
 存在 LittleFS 的 `/index.html.gz`，由固件直接吐给浏览器 —— 不依赖 CDN，设备没外网也能打开。
+带 `Accept-Encoding: gzip` 的浏览器拿 gzip，其余（如没加 `--compressed` 的 `curl`）拿未压缩版，
+不会像原来那样把 gzip 字节当 HTML 发出去。
 样式遵循 [Kailoinf/salary-calc](https://github.com/Kailoinf/salary-calc) 的 STYLE.md：
 浅色为主 + `dark:` 跟随系统、白卡片 `rounded-xl`、sky 作强调色、不用自定义 CSS。
 
@@ -195,10 +195,11 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 两个功能分开做，各占一个标签页，互不影响：
 
 - **屏蔽**：只写域名，命中就答 `0.0.0.0`（子域名一并拦截）。粘贴一整份 hosts 文件也行，
-  只要域名，前面的 `0.0.0.0` / `127.0.0.1` 会被忽略。最多 512 条。
+  只要域名，前面的 `0.0.0.0` / `127.0.0.1` 会被忽略。最多 512 条**去重后**的域名，
+  超过就整表拒绝（旧的保存结果不变），不会只存前 512 条。
 - **Hosts 映射**：写 `域名 目标IP`，设备按你给的 IPv4 应答，典型用法 `nas.home 192.168.4.100`。
   支持父域继承（`nas.home` 也覆盖 `foo.nas.home`）；AAAA 查询返回空应答，客户端自动走 IPv4。
-  最多 128 条。映射优先级高于屏蔽表（显式映射就是显式意图）。
+  最多 128 条。优先级：**封禁 > Hosts 映射 > 屏蔽表**（被封的设备连映射也拿不到）。
 
 两边都是"整表覆盖"语义：文本框里是什么就存什么，删掉一行再保存即取消。
 
@@ -251,7 +252,7 @@ https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-
   - 不支持的（正则、通配符、带路径、`$` 修饰符、`##` 外观规则）会被跳过并计数
 - URL **以 `.bin` 结尾**时按"预编译哈希表"处理（老路径），否则按文本规则解析。
 - 设备端解析的规模受 PSRAM 限制（每个域名 8 字节）：约 **30 万个域名**；超过会报
-  `out of memory` 并保留旧表。更大的表请用 `.bin`（整块 11.75MB 分区 ≈ 240 万条）。
+  `out of memory` 并保留旧表。更大的表请用 `.bin`（整块 11.94MiB 分区 ≈ 240 万条）。
 - 也想用命令行生成 `.bin`（在 LittleFS 里预置一份当兜底）：
 
 ```bash
@@ -265,6 +266,31 @@ python3 tools/build_blocklist.py data/blocklist.bin <文件或URL> ...
 curl -s http://<设备IP>/stats.json | head -c 400   # 含 up="UDP 223.5.5.5:53" / "DoH dns.alidns.com"
 curl -i http://<设备IP>/        # 面板
 ```
+
+`/stats.json` 比面板全：面板只取其中几个字段，其余专给命令行排查（加字段不需要改前端）。
+
+| 字段 | 含义 |
+|---|---|
+| `heap` / `heapTotal` / `heapMin` | 内部 SRAM 剩余 / 总量 / 启动以来最低水位（字节） |
+| `psram` / `psramTotal` / `psramMin` | PSRAM 剩余 / 总量 / 最低水位 |
+| `dnsHit` / `dnsMiss` | DNS 缓存命中 / 未命中 |
+| `dnsCacheN` / `dnsCacheBytes` / `dnsCacheCap` / `dnsEvict` | 缓存条目数 / 占用 PSRAM / 槽位上限 / 淘汰次数 |
+| `blBytes` / `blIndex` / `blCap` | 规则表字节数 / 一级索引条目数 / 分区能放的条数上限 |
+| `blIndexErr` / `blStreams` | 建索引失败的读次数（非 0 = 本次开机不拦截）/ 需要多读一段的桶数 |
+| `fsUsed` / `fsTotal` | LittleFS 已用 / 总容量 |
+| `epoch` | 当前时间戳（仍停在 1970 → NTP 没同步，规则拉取会不校验证书） |
+| `build` / `idf` / `cpu` | 固件编译时间 / ESP-IDF 版本 / CPU 频率（用来确认 OTA 真的生效） |
+| `mac` / `ssid` / `gw` / `ch` | 本机 MAC / 已连 SSID / 网关 / 信道 |
+| `tmpUp` / `tmpRemote` / `blOld` | 残留的临时文件，`true` = 上次规则表替换被打断 |
+| `dohState` / `dohBackoffS` / `dohFallback` | DoH 实际状态 / 退避剩余秒数 / 降级到 UDP 的次数 |
+| `clientN` / `banN` / `customN` / `hostN` | 客户端 / 封禁 / 自定义屏蔽 / Hosts 条数 |
+| `customCap` / `hostCap` | 自定义屏蔽 / Hosts 的条数上限（面板直接用它，不写死） |
+| `fetchChunked` | 上次拉取是 chunked 传输（长度无法校验，只有日志提示） |
+| `clients[].age` | 该客户端距离上次查询多少秒（判断表项是否过时） |
+
+> 面板「可用内存」显示的是 `heap`（**内部 SRAM**，100～200KB 是正常值）；8MB PSRAM 是独立
+> 地址空间，只有当固件显式 `heap_caps_malloc(MALLOC_CAP_SPIRAM)` 时才会用到（DNS 缓存、
+> 规则解析 arena），在 `/stats.json` 的 `psram` 字段里。
 
 配合面板「概览」看拦截/放行/缓存命中率，「规则」看 `upstat`（会显示 `fetching...` →
 `ok: N domains` / `rejected: ...`）。DNS 侧：
