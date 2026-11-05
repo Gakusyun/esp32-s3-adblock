@@ -47,7 +47,7 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
 cp src/secrets.example.h src/secrets.h
 #    编辑 src/secrets.h：WiFi、WEB_PASS / OTA_PASS、规则 URL
 
-# 2. 构建网页面板（Preact + Tailwind -> data/index.html.gz，产物已入库，改面板才需要跑）
+# 2. 构建网页面板（Preact + Tailwind，产物 data/index.html.gz，不入库，必须自己生成）
 cd web && npm install && npm run build && cd ..
 
 # 3. 预生成一份规则哈希表打进 LittleFS（也可跳过，设备首次联网会自己拉）
@@ -186,7 +186,7 @@ partitions.csv        16MB 双 OTA 分区表
 src/main.cpp          固件：DNS、面板、OTA、规则解析
 src/page.h            文件系统缺面板时的兜底提示页
 web/                  面板前端源码（Preact + Tailwind，npm run build）
-data/index.html.gz    面板构建产物（已入库，随 uploadfs 烧进 LittleFS）
+data/index.html.gz    面板构建产物（npm run build 生成，不入库，随 uploadfs 烧进 LittleFS）
 src/secrets.example.h 配置模板（WiFi / 面板密码 / 规则 URL）
 tools/build_blocklist.py  文本规则 -> 5 字节哈希表
 data/blocklist.bin    预置规则表（本地生成，未入库；烧进 LittleFS 当兜底）

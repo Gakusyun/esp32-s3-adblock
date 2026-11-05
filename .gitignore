@@ -12,9 +12,11 @@
 # Generated blocklist (build it with tools/build_blocklist.py)
 data/blocklist.bin
 
-# Dashboard build inputs/outputs (data/index.html.gz IS committed: it's the shipped page)
+# Dashboard build inputs/outputs. data/index.html.gz is a build artifact:
+# run `cd web && npm run build` before `pio run -t uploadfs`.
 web/node_modules/
 web/dist/
+data/index.html.gz
 
 # WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
 src/secrets.h
