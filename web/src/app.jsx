@@ -42,9 +42,9 @@ function Card({ title, action, children }) {
   );
 }
 
-function Field({ label, hint, children }) {
+function Field({ label, hint, children, className }) {
   return (
-    <label className="flex flex-col gap-1 text-sm text-slate-600 dark:text-slate-400">
+    <label className={'flex flex-col gap-1 text-sm text-slate-600 dark:text-slate-400' + (className ? ' ' + className : '')}>
       {label}
       {children}
       {hint ? <span className="text-xs text-slate-400 dark:text-slate-500">{hint}</span> : null}
@@ -102,7 +102,9 @@ function LoginModal({ onDone, onClose }) {
     e.preventDefault();
     setBusy(true);
     setErr('');
-    const token = btoa(`${user}:${pass}`);
+    // btoa() only takes Latin-1: encode to UTF-8 first so a password with
+    // non-ASCII characters doesn't throw InvalidCharacterError.
+    const token = btoa(String.fromCharCode(...new TextEncoder().encode(`${user}:${pass}`)));
     try {
       const r = await fetch('/auth', { headers: { ...CSRF, Authorization: `Basic ${token}` } });
       if (!r.ok) throw new Error('用户名或密码不对');
@@ -566,6 +568,14 @@ function Rules({ stats, api, run, busy }) {
           </button>
         </div>
         <p className="text-xs text-slate-500 dark:text-slate-400">上次：{stats?.upstat || '从未'}</p>
+        {stats?.upbusy ? (
+          <p className="text-xs text-sky-600 dark:text-sky-400">正在后台拉取，DNS 不受影响；结果会显示在「上次」。</p>
+        ) : null}
+        {stats?.fetchInsecure ? (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            警告：拉取时系统时间还没同步，TLS 证书未校验（中间人可篡改规则表）。检查 NTP / 时间设置。
+          </p>
+        ) : null}
       </Card>
 
       <Card title="上传规则表">
@@ -689,8 +699,7 @@ function Hosts({ stats, api, run, busy }) {
   );
 }
 
-function Toggle({ on, onChange, disabled, onLabel = '已开启', offLabel = '已关闭' }) {
-  return (
+function Toggle({ on, onChange, disabled, onLabel = '已开启', offLabel = '已关闭' }) {  return (
     <button
       type="button"
       role="switch"
@@ -709,6 +718,16 @@ function Toggle({ on, onChange, disabled, onLabel = '已开启', offLabel = '已
     </button>
   );
 }
+
+/* DoH 是“配上”了还是“真在用”：off=未启用，ntp=等时钟，ok=TLS 会话在服务，
+   down=端点失败正在回退明文 UDP，idle=已配置但还没建立会话 */
+const DOH_STATE = {
+  off: '',
+  ntp: '等待 NTP',
+  ok: '已连接',
+  down: '端点异常 · 回退 UDP',
+  idle: '未建立会话',
+};
 
 function System({ stats, api, run, busy }) {
   const [file, setFile] = useState(null);
@@ -773,6 +792,7 @@ function System({ stats, api, run, busy }) {
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 text-sm">
           {[
             ['IP', stats?.ip],
+            ['DNS 上游', stats?.up ? `${stats.up}${DOH_STATE[stats?.dohState] ? ` · ${DOH_STATE[stats.dohState]}` : ''}` : undefined],
             ['WiFi 信号', stats?.rssi ? `${stats.rssi} dBm` : undefined],
             ['温度', stats?.temp ? `${stats.temp} °C` : undefined],
             ['可用内存', stats?.heap ? `${Math.round(stats.heap / 1024)} KB` : undefined],
@@ -786,6 +806,18 @@ function System({ stats, api, run, busy }) {
           ))}
         </div>
       </Card>
+
+      {stats?.dohState === 'down' ? (
+        <div className="rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-black px-4 py-3 text-sm text-amber-800 dark:text-amber-300">
+          DoH 端点连不上，现在实际走的是<b>明文 UDP</b>（已回退 {fmt(stats.dohFallback)} 次）。
+          检查网络/系统时间；想让它宁可失败也不降级，把 <code>DOH_UDP_FALLBACK</code> 设为 0。
+        </div>
+      ) : null}
+      {stats?.dohState === 'ntp' ? (
+        <div className="rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-black px-4 py-3 text-sm text-slate-600 dark:text-slate-400">
+          DoH 已配置，但系统时间还没同步（证书有效期无法校验），暂时仍走明文 UDP。
+        </div>
+      ) : null}
     </>
   );
 }

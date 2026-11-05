@@ -1,6 +1,8 @@
 # 16MB flash, dual-OTA layout: two 2MB app slots (firmware OTA over WiFi) plus a
-# 11.75MB LittleFS holding the blocklist. A 40-bit entry is 5 bytes, so even a
-# 2M-domain list fits; the default AWAvenue list is ~10KB.
+# 11.75MB LittleFS holding the blocklist. A 40-bit entry is 5 bytes, so the whole
+# partition holds ~2.4M entries (INDEX_ENTRIES x MAX_RANGE in main.cpp cover that).
+# The device-side text parser needs 8 bytes/domain in PSRAM, so text lists are limited
+# to roughly 300k domains; a prebuilt blocklist.bin can use the whole partition.
 # Name,   Type, SubType, Offset,   Size
 nvs,      data, nvs,     0x9000,   0x5000
 otadata,  data, ota,     0xe000,   0x2000

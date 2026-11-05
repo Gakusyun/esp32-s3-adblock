@@ -15,7 +15,10 @@
 > - 上游 DNS 由 Quad9 换成 **阿里 DNS `223.5.5.5`**（国内延迟低）；
 > - 拦截规则换成 **[AWAvenue-Ads-Rule](https://github.com/TG-Twilight/AWAvenue-Ads-Rule) 完整版**；
 > - 新增**设备端解析文本规则**：直接填 AWAvenue 的 rules 文本 URL，设备自己解析 → 哈希 → 写 Flash，
->   支持 hosts / 纯域名 / AdGuard 基础语法三种格式（主 URL 失败自动换备用 CDN）；
+>   支持 hosts / 纯域名 / AdGuard 基础语法（含 `@@` 白名单）三种格式（主 URL 失败自动换备用 CDN）；
+> - 规则拉取改到**独立任务**，下载/解析期间 DNS 不再停摆；规则表采用**先写临时文件、校验、再原子 rename**
+>   的替换方式，下载失败/断电不会把拦截表清空；
+> - 新增 **DNS-over-HTTPS 上游**（可选，证书校验），规则拉取也改用 CA 校验；
 > - 删除了原项目的 C3 浏览器安装页（`docs/`）与日文 README。
 
 ## 工作原理
@@ -24,7 +27,7 @@
 DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域名）
                         ──▶ 在 Flash 的哈希表里二分查找
                              ├─ 命中 ──▶ 直接应答 0.0.0.0（黑洞）
-                             └─ 未命中 ─▶ 转发 223.5.5.5
+                             └─ 未命中 ─▶ 转发上游（UDP 223.5.5.5 或 DoH）
                                           └─▶ 答案存进 DNS 缓存（按 TTL 过期）
 ```
 
@@ -50,11 +53,12 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
   不缓存：上游抖一下就缓存住几分钟，比重新问一次更痛苦。
 - **内存按条精确分配**：每条自己 `heap_caps_malloc` 恰好 `应答长度 + 键长度` 字节
   （典型 **~110B**，不是每槽固定预 512B），已用字节实时记账，**不会溢出**。
-  两个上限，先到先算：
-  - 表项数 **1024**（`DNS_CACHE_SLOTS`，静态数组约 28KB 内部 RAM）；
-  - byte 预算：开机时按 PSRAM 实际空闲算出 `min(4MB, 空闲 - 2MB)`（N16R8 上就是 **4MB**），
-     `DNS_CACHE_BUDGET_MAX` 可改。预算只是天花板，按需分配 —— 1024 条典型只占 ~110KB。
-  > 之前写的固定 192KB 是按"每槽 512B 最坏情况"拍的，在精确分配下没有意义，已改成上面这套。
+  唯一的硬上限是**表项数 1024**（`DNS_CACHE_SLOTS`，静态数组约 28KB 内部 RAM）：
+  单条最大 `512 + 288` 字节，所以 1024 条最多占 ~800KB，典型只有 ~110KB。
+  想让缓存更大就调 `DNS_CACHE_SLOTS`（每条槽位约 28B 内部 RAM），用 `/stats.json` 的
+  `dnsCacheN` / `dnsCacheBytes` 观察。
+  > 早先这里还有一个“按空闲 PSRAM 算出来的 4MB byte 预算”。它永远比表项数先到不了，
+  > 属于假装是上限，已经删掉。
 - **缺空间时的淘汰策略**（类似页面置换）：
   1. 已过期的先丢；
   2. 否则丢“**TTL 最接近过期**”的；
@@ -62,14 +66,59 @@ DNS 查询 ──▶ 取出域名 ──▶ FNV-1a 哈希（连同各级父域�
   4. 再一样就丢**最久没被用过**的（LRU）。
   被拦截/被 Hosts 映射的查询不经过缓存，只有真正转发的才会占位。
 - 规则表更新（远程拉取 / 网页上传）时清空一次缓存，避免新规则与旧答案不一致。
-- 面板「概览 → 统计」只显示**缓存命中率**（命中 / 未命中次数）；条目数、占用字节、预算、淘汰次数
-  不在面板里显示，但都在 `/stats.json`：`dnsCacheN`、`dnsCacheBytes`、`dnsCacheBudget`、`dnsEvict`，
+- 面板「概览 → 统计」只显示**缓存命中率**（命中 / 未命中次数）；条目数、占用字节、淘汰次数
+  不在面板里显示，但都在 `/stats.json`：`dnsCacheN`、`dnsCacheBytes`、`dnsEvict`，
   命令行排查用。
 
 > ⚠️ 如果自己写 PSRAM 分配，别用 Arduino 的 `ps_malloc()`：在这套预编译 opi 库下它
 > 会因内部的 `spiramDetected` 标志未置位而**恒返回 NULL**（`ESP.getPsramSize()` 也报 0），
 > 但 `heap_caps_get_total_size(MALLOC_CAP_SPIRAM)` 能看到完整 8MB。
 > 本固件统一用 `heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`。
+
+### 上游：UDP 还是 DoH
+
+默认上游是**明文 UDP/53 发到 `223.5.5.5`**。只要能处在链路上（同一个 Wi-Fi、被劫持的路由器、
+运营商），任何人就能**改你收到的答案**：他可以直接回一个看起来正常的 A 记录，你的规则表根本
+看不到这个域名，拦截也就失效了。改不了拦截规则的，但能绕过它（或者反过来用 DNS 投毒）。
+
+想要防中间人，在 `secrets.h` 里设 `DOH_URL`（**RFC 8484**）：
+
+```cpp
+#define DOH_URL "https://dns.alidns.com/dns-query"   // 阿里，国内直连
+// #define DOH_URL "https://doh.pub/dns-query"       // 腾讯
+#define DOH_UDP_FALLBACK 1      // 端点不可用时回退明文 UDP；0 = 严格模式（宁可不解析）
+```
+
+- 查询被封装成一个 `application/dns-message` 的 HTTPS POST，**TLS 证书用内置根证书包校验**
+  （不做 `setInsecure`）；报文仍走原来的 txid + 问题段校验。
+- **一条 TLS 会话长连接复用**：每次查询都重新握手会多 0.3–1 s（80MHz 的 S3 上），
+  所以只断线时重连。代价是常驻 **~45KB 堆**。
+- 需要 **NTP**：没时钟就校验证书有效期，所以 SNTP 同步之前 DoH 不会启用（会先走 UDP）。
+- 端点挂掉时：`DOH_UDP_FALLBACK=1` 会在 30s 退避后回退到 UDP，`dohFallback` 计数在
+  `/stats.json`，面板不隐藏降级；`0` 则直接解析失败（真正“不降级”的选项）。
+- **配置了 ≠ 生效中**。`/stats.json` 的 `dohState` 说真话：
+  | 值 | 含义 |
+  |---|---|
+  | `off` | `DOH_URL` 为空，走上游 UDP |
+  | `ntp` | 已配，但还没 SNTP 同步（证书无法校验）→ 查询仍走明文 UDP |
+  | `idle` | 已配、时钟 OK，但还没有活着的 TLS 会话（刚开机/下次重连） |
+  | `ok` | **TLS 会话已建立并在服务**，这才是真在用 DoH |
+  | `down` | 最近一次失败，处于 30s 退避中 → 回退明文 UDP（面板会弹黄色警告） |
+- 面板「系统 → 设备信息」的 **DNS 上游** 会带上这个状态；`dohOk` / `dohFail` /
+  `dohFallback` 是三个计数器。想确认真的在用 DoH：
+  ```bash
+  curl -s http://<设备IP>/stats.json | grep -o '"up":"[^"]*","dohState":"[^"]*"'
+  # -> "up":"DoH dns.alidns.com","dohState":"ok"
+  ```
+  注意 `dohState` 只描述**转发到上游**的那部分查询；被拦截、Hosts 映射、缓存命中的查询
+  本来就不会去上游。
+- ⚠️ `DOH_URL` 是编译期宏（不归 `/setupdate` 管），改完要 `pio run -t upload` 重刷固件，
+  只 `uploadfs` 不生效。SNTP 本身仍是明文 NTP（`223.5.5.5`/`ntp.aliyun.com`），DoH 覆盖不到它。
+- 想先确认端点本身能用（在 PC 上）：
+  ```bash
+  curl -s -D - -o reply.bin -H 'content-type: application/dns-message' \
+       --data-binary @q.bin https://dns.alidns.com/dns-query   # q.bin = 一条裸 DNS 查询
+  ```
 
 ## 硬件
 
@@ -132,10 +181,10 @@ WiFi 连不上时（或没填 `secrets.h`）会开一个开放热点 **`S3-AdBlo
 |---|---|
 | 概览 | 拦截状态（暂停 30s/5min/30min/手动恢复）、拦截/放行/规则数/**缓存命中率**、温度·内存·信号·时长、规则源 |
 | 客户端 | 每个 IP/MAC 的拦截/放行计数，搜索、封禁/解封 |
-| 规则 | 改规则 URL 与更新间隔、立即拉取、上传 `blocklist.bin` |
+| 规则 | 改规则 URL 与每天几点更新、立即拉取、上传 `blocklist.bin` |
 | 屏蔽 | 自定义屏蔽：一个文本框，一行一个域名（也接受 hosts 格式），整表保存 |
 | Hosts | 自定义 hosts 映射：`域名 IP`，设备直接应答该 IP |
-| 系统 | 指示灯开关（关掉 WS2812）、固件 OTA 上传、设备信息 |
+| 系统 | 指示灯开关（关掉 WS2812）、固件 OTA 上传、设备信息（含当前 DNS 上游） |
 
 ### 自定义屏蔽 vs Hosts 映射
 
@@ -176,20 +225,29 @@ https://cdn.jsdelivr.net/gh/TG-Twilight/AWAvenue-Ads-Rule@main/Filters/AWAvenue-
 - 主用的 jsDelivr 在国内可直连；`RULE_URL_FALLBACK` 是同一份文件的 gcore 节点，
   主 URL 失败时自动回退。`raw.githubusercontent.com` 在国内常常不通，别用。
 - **每天固定的本地时间自动拉一次**（`RULE_HOUR`，默认 **03:00 UTC+8**，时区 `RULE_TZ`），
-  不再是"开机后 N 小时"——拉取是同步的，那几秒 DNS 会暂停应答，放在半夜谁也察觉不到。
+  不再是"开机后 N 小时"。拉取在**独立 FreeRTOS 任务**里跑（TLS + 解析在堆里做，
+  下载再慢 DNS 也照常应答），结果由主循环收集。
   设备开机后 NTP 同步时间（`ntp.aliyun.com` / `223.5.5.5`）；同一个本地日期只拉一次，
   重启也不会重复拉（日期存在 `/update.cfg`）。几个例外：
   - 开机时设备里**没有规则表**（`numHashes == 0`）→ 立刻拉，不等半夜；
   - 拉取失败 → 10 分钟后重试，直到成功；
-  - NTP 不可达（时钟没同步）→ 退化成"开机后每 24 小时一次"。
-- 面板「规则」页可以改 URL、**每天几点更新**、时区，或点「立即拉取」。
+  - NTP 不可达（时钟没同步）→ 退化成"开机后每 24 小时一次"，
+    并且**规则拉取不校验证书**（面板会提示 `fetchInsecure`，能修就先修 NTP）。
+- 面板「规则」页可以改 URL、**每天几点更新**、时区，或点「立即拉取」（立即返回，
+  进度看「上次」/`upbusy`）。
+- **替换是原子的**：新表先写进临时文件（`/blupdate.new` 或 `/blocklist.new`），校验
+  （非空、5 字节整数倍、**严格有序**、`Content-Length` 对得上）之后才 `rename()` 覆盖旧的。
+  所以下载被截断、证书失效、写满、断电都不会把正在用的规则表弄没（旧版本是**先删再写**）。
 - 规则表被替换（远程拉取 / 网页上传）时**清空一次 DNS 缓存**：旧答案可能指向新规则要拦的域名。
-- 设备端支持的格式：
+- 设备端支持的格式（与 `tools/build_blocklist.py` 保持一致）：
   - hosts：`0.0.0.0 ads.example.com`、`127.0.0.1 x`、`:: x`（一行多个域名也支持）
   - 纯域名列表：一行一个
   - AdGuard / ABP 基础规则：`||ads.example.com^`
-  - 不支持的（正则、通配符、`$` 修饰符、`##` 外观规则、`@@` 白名单）会被跳过并计数
+  - `@@||ads.example.com^` **白名单**：会从同一份表里减掉（不再被忽略而误拦）
+  - 不支持的（正则、通配符、带路径、`$` 修饰符、`##` 外观规则）会被跳过并计数
 - URL **以 `.bin` 结尾**时按"预编译哈希表"处理（老路径），否则按文本规则解析。
+- 设备端解析的规模受 PSRAM 限制（每个域名 8 字节）：约 **30 万个域名**；超过会报
+  `out of memory` 并保留旧表。更大的表请用 `.bin`（整块 11.75MB 分区 ≈ 240 万条）。
 - 也想用命令行生成 `.bin`（在 LittleFS 里预置一份当兜底）：
 
 ```bash
@@ -200,11 +258,18 @@ python3 tools/build_blocklist.py data/blocklist.bin <文件或URL> ...
 ## 验证
 
 ```bash
+curl -s http://<设备IP>/stats.json | head -c 400   # 含 up="UDP 223.5.5.5:53" / "DoH dns.alidns.com"
+curl -i http://<设备IP>/        # 面板
+```
+
+配合面板「概览」看拦截/放行/缓存命中率，「规则」看 `upstat`（会显示 `fetching...` →
+`ok: N domains` / `rejected: ...`）。DNS 侧：
+
+```bash
 dig @<设备IP> doubleclick.net   # -> 0.0.0.0（被拦）
-dig @<设备IP> github.com        # -> 真实 IP（转发，第一次 ~40ms）
+dig @<设备IP> github.com        # -> 真实 IP（转发，UDP 第一次 ~40ms）
 dig @<设备IP> github.com        # -> 同样答案，第二次走缓存（<5ms，TTL 递减）
 curl -s http://<设备IP>/stats.json | grep -o '"dnsH[^,]*,"dnsM[^,]*'   # 命中/未命中计数
-curl -i http://<设备IP>/        # 面板
 ```
 
 把设备的 IP 设为路由器 DHCP 下发的 DNS（或单机手动指定）即可全屋生效。
@@ -218,14 +283,20 @@ curl -i http://<设备IP>/        # 面板
 - 板载 RGB 灯也能关：面板「系统 → 指示灯」切成关闭，固件就不再驱动 WS2812（`/setled?s=0`），
   设置存 `/led.cfg`，重启仍生效。开着时绿色=拦截中、琥珀色=已暂停、蓝色=启动中/未联网。
   部分板子另有一颗直接接电源的指示灯，那颗固件关不掉。
+- 开了 DoH 会多占 **~45KB 堆**（否则无所谓）；80MHz 下 TLS 握手比 240MHz 慢，
+  断线后的第一次解析可能多花 0.3–1 s（之后复用长连接，与 UDP 差别不大）。
 
 ## 已知限制
 
 - 只支持 Wi-Fi 2.4GHz（芯片限制），不支持 5GHz。
 - 面板/OTA 都是明文 HTTP；局域网信任边界内的防护，不是加密方案。
+- `/stats.json` 不鉴权（内网只读），里面有每个客户端的 IP/MAC、自定义屏蔽与 Hosts 表。
+- 默认上游是**明文 UDP DNS**（可被链路上的中间人改写/投毒），想防就开 DoH（见上）。
+  规则拉取用 CA 校验，但**没有 NTP 时会降级不校验**（面板会提示 `fetchInsecure`）。
 - DNS 应答已按 EDNS 规范重建（只带 question + 1 条 answer，ARCOUNT=0），
   个别客户端若仍异常，优先怀疑上游/DNS 报文被中间设备改写。
-- 规则更新时是同步下载解析，几秒内 DNS 会暂停响应（设备规模小，影响可接受）。
+- 上游转发在解析器里是阻塞等待（最多 1s），等待期间会穿插 `web.handleClient()`，
+  所以面板不会卡，但 DNS 查询本身是串行的（家庭规模够用）。
 - Ubuntu/Fedora 上的 ModemManager 会抢 `/dev/ttyACM0` 并反复复位板子：
   ```bash
   sudo systemctl stop ModemManager
