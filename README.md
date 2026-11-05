@@ -130,6 +130,13 @@ curl -i http://<设备IP>/        # 面板
 
 把设备的 IP 设为路由器 DHCP 下发的 DNS（或单机手动指定）即可全屋生效。
 
+## 功耗与温度
+
+- CPU 降到 **80MHz**（Wi-Fi 仍正常），网页面板轮询 3s → **10s**，Wi-Fi 发射功率降到 **11dBm**
+  （近距离完全够用）。实测芯片内部温度从 ~43°C 降到 ~39°C，`dig` 拦截查询 8–16ms、转发 40–48ms。
+- Wi-Fi **modem sleep 保持关闭**（`WiFi.setSleep(false)`）：DNS 响应优先，这是有意的取舍。
+- 冷启动后第一次关联偶尔会被路由器以 `reason=202` 拒绝（旧关联未过期），固件会**自动重试 3 次**。
+
 ## 已知限制
 
 - 只支持 Wi-Fi 2.4GHz（芯片限制），不支持 5GHz。
@@ -153,7 +160,7 @@ src/main.cpp          固件：DNS、面板、OTA、规则解析
 src/page.h            面板 HTML
 src/secrets.example.h 配置模板（WiFi / 面板密码 / 规则 URL）
 tools/build_blocklist.py  文本规则 -> 5 字节哈希表
-data/blocklist.bin    预置规则表（烧进 LittleFS）
+data/blocklist.bin    预置规则表（本地生成，未入库；烧进 LittleFS 当兜底）
 ```
 
 ## 许可

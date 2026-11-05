@@ -84,5 +84,5 @@ let fd=new FormData();fd.append('f',f);
 try{let r=await fetch('/upload',{method:'POST',headers:CSRF_HDRS,body:fd});upmsg.textContent=r.ok?'✓ 已更新':'✗ '+await r.text();}
 catch(_){upmsg.textContent='✗ 上传失败';}
 blf.value='';setTimeout(load,600);};
-load();setInterval(load,3000);
+load();setInterval(load,10000);
 </script></body></html>)HTML";

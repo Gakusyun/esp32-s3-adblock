@@ -686,9 +686,16 @@ static bool connectWiFi() {
   const char* pass = ss.length() ? pw.c_str() : WIFI_PASS;
   if (!ssid || !*ssid || strcmp(ssid, "YOUR_WIFI_SSID") == 0) return false;  // unconfigured
   Serial.printf("WiFi: connecting to \"%s\"%s\n", ssid, ss.length() ? " (provisioned)" : " (secrets.h)");
-  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.onEvent(onWifiEvent); WiFi.begin(ssid, pass);
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) { delay(250); Serial.print("."); }
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setTxPower(WIFI_POWER_11dBm); WiFi.onEvent(onWifiEvent);
+  // A cold reset right after a previous session can be rejected once by the AP
+  // (reason=202 AUTH_FAIL) while it still holds the stale association — retry a
+  // couple of times instead of dropping straight into the setup portal.
+  for (int attempt = 1; attempt <= 3 && WiFi.status() != WL_CONNECTED; attempt++) {
+    if (attempt > 1) { Serial.printf(" [retry %d]\n", attempt); WiFi.disconnect(true); delay(1000); }
+    WiFi.begin(ssid, pass);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { delay(250); Serial.print("."); }
+  }
   Serial.println();
   if (WiFi.status() != WL_CONNECTED) {                 // diagnostics: why did the join fail?
     Serial.printf("[wifi] failed, status=%d (1=no ssid, 4=connect failed, 6=disconnected)\n", (int)WiFi.status());
@@ -732,7 +739,7 @@ static void startConfigPortal() {
   for (int i = 0; i < n && i < 15; i++) portalOpts += "<option value='" + htmlEscape(WiFi.SSID(i)) + "'>";
   uint8_t mac[6]; WiFi.macAddress(mac);
   char ap[24]; snprintf(ap, sizeof(ap), "S3-AdBlock-%02X%02X", mac[4], mac[5]);
-  WiFi.mode(WIFI_AP); WiFi.softAP(ap);
+  WiFi.mode(WIFI_AP); WiFi.setTxPower(WIFI_POWER_11dBm); WiFi.softAP(ap);
   IPAddress apIP = WiFi.softAPIP();
   dnsPortal.start(53, "*", apIP);              // catch-all -> phones pop the captive portal
   web.on("/", handlePortalRoot);
@@ -754,6 +761,10 @@ static void startConfigPortal() {
 
 void setup() {
   Serial.begin(115200); delay(300);
+  // 80MHz keeps Wi-Fi fully functional while cutting dynamic power (and heat).
+  // Modem sleep stays OFF (WiFi.setSleep(false)) — DNS latency wins over idle watts.
+  setCpuFrequencyMhz(80);
+  Serial.printf("[s3-adblock] cpu %u MHz\n", (unsigned)getCpuFrequencyMhz());
   Serial.println("\n[s3-adblock] booting");
   if (!LittleFS.begin(true)) Serial.println("LittleFS FAILED");
   blocklist = LittleFS.open(BLOCKLIST_PATH, "r");
